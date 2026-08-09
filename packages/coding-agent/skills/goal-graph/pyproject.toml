@@ -1,0 +1,16 @@
+# Kernel-side package for the bundled goal-graph skill. It is pure stdlib and
+# talks to no host handler yet: the graph runs inline in the orchestrator's own
+# kernel. Dispatching model-backed nodes lands separately.
+[project]
+name = "goal-graph"
+version = "0.1.0"
+description = "Prime Agent goal graph: one decomposable graph of work executed from the kernel"
+requires-python = ">=3.10"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/goal_graph"]

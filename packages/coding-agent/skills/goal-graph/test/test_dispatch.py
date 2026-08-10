@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Callable
 
 from goal_graph import Done, Expand, Graph, Node, register
-from goal_graph.dispatch import DispatchHandle, build_child_prompt, parse_result, result_path
+from goal_graph.dispatch import (
+    DispatchHandle,
+    build_child_prompt,
+    parse_result,
+    read_result,
+    result_path,
+)
 
 
 def run(coro):
@@ -493,6 +499,143 @@ class ChildOutcomeTest(DispatchTestCase):
 
         self.assertEqual(g.get(node.id).state, "failed")
         self.assertIn("unknown outcome 'maybe'", g.get(node.id).error or "")
+
+
+class JoinRobustnessTest(DispatchTestCase):
+    """Defects that escaped the join's ValueError-only handling and either
+    crashed the whole run or discarded finished work."""
+
+    def test_a_non_dict_args_in_an_expansion_fails_only_that_node(self) -> None:
+        # `dict(5)` raises TypeError, not ValueError, so before the fix one
+        # badly formed child answer aborted the entire run instead of failing
+        # just that node.
+        register(lambda ctx: Done("fine"), name="survives")
+        g = self.graph()
+        model = g.add(Node(intent="split", prompt="decide"))
+        inline = g.add(Node(intent="inline", fn="survives"))
+        run(g.run())
+        self.write_result(
+            g,
+            model.id,
+            {"outcome": "expand", "children": [{"intent": "bad", "prompt": "x", "args": 5}]},
+        )
+        self.dispatcher.status["sub-1"] = "completed"
+
+        run(g.run())
+
+        self.assertEqual(g.get(model.id).state, "failed")
+        self.assertIn("args must be an object", g.get(model.id).error or "")
+        self.assertEqual(g.get(inline.id).state, "done", "the run survived the malformed child")
+
+    def test_read_result_converts_a_vanished_file_to_a_value_error(self) -> None:
+        # A result file that existed at the probe and vanished before the read
+        # raises OSError, which would escape the join. It is surfaced as a
+        # ValueError so the node fails or reopens rather than the run crashing.
+        with self.assertRaisesRegex(ValueError, "could not be read"):
+            read_result(Path(self.store_dir) / "does-not-exist.json")
+
+    def test_an_answer_landing_between_the_probe_and_the_status_check_is_joined(self) -> None:
+        # The result file is probed before the registry snapshot, so an answer
+        # that lands in that gap used to be treated as missing and the completed
+        # work discarded. The join now re-tests the file after a terminal status.
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+
+        def land_during_status(call: int) -> None:
+            self.write_result(g, node.id, {"outcome": "done", "result": "landed"})
+            self.dispatcher.status["sub-1"] = "completed"
+
+        self.dispatcher.on_status = land_during_status
+        report = run(g.run())
+
+        self.assertTrue(report.complete)
+        self.assertEqual(g.get(node.id).state, "done")
+        self.assertEqual(g.get(node.id).result, "landed")
+
+
+class StaleClaimTest(DispatchTestCase):
+    """A parent that compacts or restarts finds its old child absent from the
+    session-scoped registry. Without a timeout the node stays claimed forever."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.dispatcher = FakeDispatcher(models=("opencode-go/glm-5.2", "devin-2/glm-5-2"))
+
+    def test_an_absent_child_past_the_timeout_reopens_for_the_next_model(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+        self.assertEqual(g.get(node.id).tried_models, ("opencode-go/glm-5.2",))
+
+        # Simulate a restart: the registry no longer reports the old child, and
+        # the claim is older than the timeout.
+        self.dispatcher.status.clear()
+        g.get(node.id).claimed_at = 0.0
+
+        report = run(g.run(claim_timeout_seconds=1))
+
+        self.assertEqual(
+            g.get(node.id).state,
+            "claimed",
+            "an absent child past the timeout is treated as a dead attempt and retried",
+        )
+        self.assertEqual(g.get(node.id).tried_models, ("opencode-go/glm-5.2", "devin-2/glm-5-2"))
+        self.assertEqual(self.dispatcher.spawns[1][2], "devin-2/glm-5-2")
+        self.assertEqual(report.stopped, "in_flight")
+
+    def test_an_absent_child_within_the_timeout_stays_claimed(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+
+        self.dispatcher.status.clear()
+        # claimed_at is fresh, so the timeout has not elapsed.
+
+        report = run(g.run(claim_timeout_seconds=3600))
+
+        self.assertEqual(g.get(node.id).state, "claimed")
+        self.assertEqual(report.stopped, "in_flight")
+
+
+class StaleMetadataTest(DispatchTestCase):
+    """A node that failed over before succeeding carried the dead attempt's
+    metadata. It is cleared once the work succeeds so a checkpoint does not
+    read as though the node failed or is still mid-dispatch."""
+
+    def test_a_done_node_drops_a_prior_attempt_s_error(self) -> None:
+        self.dispatcher = FakeDispatcher(models=("opencode-go/glm-5.2", "devin-2/glm-5-2"))
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+        # First attempt dies, setting node.error and reopening the node.
+        self.dispatcher.status["sub-1"] = "error"
+        run(g.run())
+        self.assertIsNotNone(g.get(node.id).error)
+
+        # Second attempt succeeds.
+        self.write_result(g, node.id, {"outcome": "done", "result": "ok"}, attempt=1)
+        report = run(g.run())
+
+        self.assertTrue(report.complete)
+        self.assertEqual(g.get(node.id).state, "done")
+        self.assertIsNone(g.get(node.id).error, "a succeeded node carries no failure message")
+
+    def test_an_expansion_clears_the_old_body_s_claim_metadata(self) -> None:
+        self.dispatcher = FakeDispatcher(models=("opencode-go/glm-5.2",))
+        g = self.graph()
+        node = g.add(Node(intent="split", prompt="decide", model="opencode-go/glm-5.2"))
+        run(g.run())
+        self.assertEqual(g.get(node.id).tried_models, ("opencode-go/glm-5.2",))
+        self.assertIsNotNone(g.get(node.id).claimed_at)
+
+        self.write_result(g, node.id, {"outcome": "expand", "children": [{"intent": "child", "prompt": "do"}]})
+        run(g.run())
+
+        self.assertIsNone(g.get(node.id).claimed_at, "the old attempt's start is stale on a collector node")
+        self.assertEqual(g.get(node.id).tried_models, (), "the old body's attempts do not describe the new body")
+        self.assertIsNone(g.get(node.id).error)
+        self.assertIsNone(g.get(node.id).child_id)
 
 
 class ResultParsingTest(unittest.TestCase):

@@ -100,6 +100,21 @@ Pass `wait_seconds` to block in the cell instead of ending the turn. A child
 that the subagent registry reports as finished without leaving a result file
 fails its node saying so, rather than holding the graph open forever.
 
+The subagent registry is session-scoped, so a parent that compacts or restarts
+and reopens the graph with a dispatcher finds its old `child_id` absent. A
+claimed node whose child is absent and whose claim is older than
+`claim_timeout_seconds` (default 600s) is treated as a dead attempt and
+reopened for the next candidate model, rather than staying claimed forever. A
+graph reopened without a dispatcher still reports `"detached"` for such nodes,
+since nothing here can re-dispatch them.
+
+A malformed child answer (an `expand` whose `args` is not an object, or a result
+file that vanishes between the probe and the read) fails only that node rather
+than aborting the whole run. A result that lands between the file probe and the
+registry status check is still joined, so finished work is not discarded over
+timing. A node that failed over and then succeeds drops the dead attempt's
+error and claim metadata, so a checkpoint does not read as though it failed.
+
 A dispatched child may itself return `expand`, so decomposition is available at
 any depth, not only to whatever created the graph. Its children may name an `fn`
 registered in this kernel, and may name a `model`.
@@ -118,7 +133,7 @@ finished work is not discarded over timing.
   run.
 - `g.add(node)` — add one node. Its `needs` must already exist and must not form
   a cycle.
-- `await g.run(max_supersteps=10000, max_nodes=10000, max_in_flight=4, wait_seconds=0, poll_seconds=2, save=True)`
+- `await g.run(max_supersteps=10000, max_nodes=10000, max_in_flight=4, wait_seconds=0, poll_seconds=2, claim_timeout_seconds=600, save=True)`
   — join finished children, run the frontier, dispatch model nodes, checkpoint,
   repeat until nothing is runnable. Returns a `RunReport` with `stopped`,
   `supersteps`, `executed`, `counts`, `pending_dispatch`, `in_flight`, and

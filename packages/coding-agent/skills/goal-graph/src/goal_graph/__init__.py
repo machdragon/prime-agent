@@ -90,6 +90,12 @@ DEFAULT_MAX_SUPERSTEPS = 10_000
 DEFAULT_MAX_NODES = 10_000
 DEFAULT_MAX_IN_FLIGHT = 4
 DEFAULT_POLL_SECONDS = 2.0
+#: How long a claimed node may wait for a child the registry no longer knows
+#: about before the join treats it as a dead attempt and reopens it. The RLM
+#: subagent registry is session-scoped, so a parent that compacts or restarts
+#: and reopens the graph finds its old `child_id` absent; without a timeout the
+#: node stays claimed forever even though no one is working on it.
+DEFAULT_CLAIM_TIMEOUT_SECONDS = 600.0
 
 #: Why `run()` returned. Only "complete" means the graph has nothing left to do.
 STOP_REASONS: tuple[str, ...] = (
@@ -265,6 +271,7 @@ class Graph:
         max_in_flight: int = DEFAULT_MAX_IN_FLIGHT,
         wait_seconds: float = 0.0,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
+        claim_timeout_seconds: float = DEFAULT_CLAIM_TIMEOUT_SECONDS,
         save: bool = True,
     ) -> RunReport:
         """Run the frontier until nothing is runnable.
@@ -278,6 +285,12 @@ class Graph:
         Call `run()` again when one messages back, or pass `wait_seconds` to
         block here instead. Limits are safety rails: reaching one is not
         completion.
+
+        `claim_timeout_seconds` bounds how long a claimed node may wait for a
+        child the registry no longer reports (a parent that compacted or
+        restarted and reopened the graph finds its old `child_id` absent, since
+        the registry is session-scoped). Past the timeout the node reopens for
+        the next candidate model rather than staying claimed forever.
         """
         if max_supersteps < 1:
             raise ValueError("max_supersteps must be at least 1")
@@ -287,6 +300,8 @@ class Graph:
             raise ValueError("max_in_flight must be at least 1")
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
+        if claim_timeout_seconds <= 0:
+            raise ValueError("claim_timeout_seconds must be positive")
 
         supersteps = 0
         executed = 0
@@ -299,7 +314,7 @@ class Graph:
             if supersteps >= max_supersteps:
                 stopped = "max_supersteps"
                 break
-            joined = await self._ingest()
+            joined = await self._ingest(claim_timeout_seconds)
             frontier = self.frontier()
             inline = [node for node in frontier if node.kind != "model"]
             dispatchable = self._dispatchable(frontier, max_in_flight)
@@ -339,12 +354,16 @@ class Graph:
             blocked=tuple(node.id for node in self.blocked()),
         )
 
-    async def _ingest(self) -> int:
+    async def _ingest(self, claim_timeout_seconds: float) -> int:
         """Join finished children. Returns how many claimed nodes were resolved.
 
         A result file is the outcome. A child the registry reports as finished
         without one did not follow the protocol, and its node fails saying so
-        rather than holding the graph open forever.
+        rather than holding the graph open forever. A child the registry no
+        longer reports at all (a parent that compacted or restarted finds its
+        session-scoped `child_id` absent) is treated as a dead attempt once its
+        claim is older than `claim_timeout_seconds`, so the node reopens instead
+        of waiting forever.
         """
         claimed = self._in_flight()
         if not claimed:
@@ -357,13 +376,28 @@ class Graph:
                 statuses = await self._dispatcher.statuses()
             return (statuses or {}).get(node.child_id or "")
 
+        def reopen(node: Node, reason: str) -> None:
+            # A dead attempt reopens for the next candidate model; only an
+            # exhausted list fails the node, which `_dispatch` handles.
+            node.error = reason
+            node.state = "open"
+            node.child_id = None
+            node.claimed_at = None
+
         resolved = 0
+        now = _now()
         for node in claimed:
             path = result_path(self.results_dir, node.id, max(0, len(node.tried_models) - 1))
             if path.exists():
                 try:
                     outcome = parse_result(read_result(path), node)
-                except ValueError as exc:
+                except (ValueError, TypeError, OSError) as exc:
+                    # `parse_result`'s contract is that every child protocol
+                    # error raises ValueError, but a non-dict `args` reaches
+                    # `dict(...)` and raises TypeError, and a result file that
+                    # vanishes between the probe and the read raises OSError.
+                    # Both would otherwise escape the join and abort the whole
+                    # run, so they are caught here and blamed on the child.
                     # A child still working may be mid-write. Failing it here
                     # would discard finished work over timing, so only a child
                     # that has stopped can be blamed for what its file contains.
@@ -377,19 +411,52 @@ class Graph:
                 continue
             status = await status_of(node)
             if status in (CHILD_COMPLETED, CHILD_ERROR):
+                # The file probe happened before the registry snapshot, so a
+                # result that landed in that gap is sitting on disk now. Re-test
+                # before blaming the child, or finished work is discarded.
+                if path.exists():
+                    try:
+                        outcome = parse_result(read_result(path), node)
+                    except (ValueError, TypeError, OSError) as exc:
+                        if await status_of(node) == CHILD_RUNNING:
+                            continue
+                        node.state = "failed"
+                        node.error = str(exc)
+                    else:
+                        self._apply(node, outcome)
+                    resolved += 1
+                    continue
                 # A child that stopped without a result usually means the
                 # provider gave out rather than the work being wrong, which is
                 # what a quota-exhausted provider looks like from here: the
                 # spawn is accepted because the credentials are still valid, and
                 # the child dies partway. So the node reopens for the next
                 # candidate model, and only an exhausted list fails it.
-                node.error = (
+                reopen(
+                    node,
                     f"child {node.child_id} on {node.tried_models[-1] if node.tried_models else 'the parent model'} "
-                    f"finished as {status} without writing {path}"
+                    f"finished as {status} without writing {path}",
                 )
-                node.state = "open"
-                node.child_id = None
-                node.claimed_at = None
+                resolved += 1
+                continue
+            if (
+                status is None
+                and self._dispatcher is not None
+                and node.claimed_at is not None
+                and (now - node.claimed_at) >= claim_timeout_seconds
+            ):
+                # The registry is session-scoped, so a parent that compacted or
+                # restarted and reopened the graph with a dispatcher finds its
+                # old `child_id` absent: `status_of` returns None, which is
+                # neither running nor finished, so without a timeout the node
+                # stays claimed forever. Treat a claim older than the timeout as
+                # a dead attempt. A graph with no dispatcher stays "detached":
+                # nothing here can re-dispatch, so the claim is left alone.
+                reopen(
+                    node,
+                    f"child {node.child_id} on {node.tried_models[-1] if node.tried_models else 'the parent model'} "
+                    f"has been absent from the registry for {int(now - node.claimed_at)}s; reopening",
+                )
                 resolved += 1
         return resolved
 
@@ -511,6 +578,9 @@ class Graph:
         if isinstance(outcome, Reject):
             node.state = "rejected"
             node.reason = outcome.reason
+            # A node that failed over before succeeding carried a dispatch error
+            # describing an attempt that is no longer the verdict. `reason` is.
+            node.error = None
             return
 
         if isinstance(outcome, Done):
@@ -522,6 +592,10 @@ class Graph:
                 return
             node.state = "done"
             node.result = outcome.result
+            # Same as Reject: a prior attempt's dispatch error is not the
+            # verdict once the work has succeeded, and leaving it set makes a
+            # checkpoint read as though the node failed when it did not.
+            node.error = None
             return
 
         # `replace` rather than listing fields: parentage is the only thing being
@@ -549,6 +623,14 @@ class Graph:
         node.prompt = None
         node.model = None
         node.child_id = None
+        # The body is replaced, so the metadata that described the old body's
+        # dispatch is stale on what is now a collector node: `claimed_at` named
+        # the old attempt's start and `tried_models` the models the old body
+        # ran. Left set, a checkpoint read as though the node were still mid-
+        # dispatch when it is waiting on its children.
+        node.claimed_at = None
+        node.tried_models = ()
+        node.error = None
         # Set explicitly rather than left alone: an expansion arriving from a
         # dispatched child finds the node claimed, and a node that stays claimed
         # is never runnable and has its result file re-read forever.

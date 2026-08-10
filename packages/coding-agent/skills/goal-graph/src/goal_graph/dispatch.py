@@ -223,11 +223,19 @@ def _child_node(raw: Any, parent: Node) -> Node:
         raise ValueError(f"child of {parent.id} is missing an intent")
     # `needs` is deliberately absent here: it names sibling keys, which only mean
     # something once every sibling has an id. `_expand_children` fills it in.
+    args = raw.get("args")
+    if args is None:
+        args: dict[str, Any] = {}
+    elif not isinstance(args, dict):
+        # `dict(5)` raises TypeError, which is not a ValueError and so would
+        # escape the join's protocol-error handling and abort the whole run.
+        # The contract is that every malformed child value fails only this node.
+        raise ValueError(f"child of {parent.id} args must be an object, got {type(args).__name__}")
     return Node(
         intent=intent,
         fn=_optional_str(raw.get("fn"), "fn", parent),
         prompt=_optional_str(raw.get("prompt"), "prompt", parent),
-        args=dict(raw.get("args") or {}),
+        args=args,
         model=_optional_str(raw.get("model"), "model", parent),
     )
 
@@ -245,3 +253,8 @@ def read_result(path: Path) -> Any:
         return json.loads(Path(path).read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"result file {path} is not valid JSON: {exc}") from None
+    except OSError as exc:
+        # The file existed at the probe and vanished before the read, e.g. a
+        # concurrent cleanup. That is a timing failure, not a crash: the join
+        # treats it as a child protocol error and reopens or fails the node.
+        raise ValueError(f"result file {path} could not be read: {exc}") from None

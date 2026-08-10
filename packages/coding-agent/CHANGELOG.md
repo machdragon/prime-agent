@@ -2,12 +2,16 @@
 
 ## [Unreleased]
 
+- Added a `claim_timeout_seconds` option to goal graph `run()`, so a claimed node whose child is absent from the session-scoped registry (after the parent compacted or restarted) reopens for the next model instead of staying claimed forever.
 - Added fallback models to goal graph dispatch, so work whose provider runs out of quota is retried on the next model instead of failing.
 - Changed the goal graph run report to name the model, child, and elapsed time of each running sub-task, so a working one can be told from a stuck one.
 
 - Fixed a goal graph becoming permanently unreadable after a node that named a model was split into sub-steps.
 - Fixed sub-steps losing the model they asked for, and sub-step ordering being rejected outright.
 - Fixed a result read while it was still being written failing work that had actually succeeded.
+- Fixed a malformed sub-task answer (a non-object `args`, or a result file that vanished mid-read) aborting the entire goal graph run instead of failing only that node.
+- Fixed a sub-task answer that landed between the result-file probe and the registry status check being discarded, so finished work was retried or marked failed despite sitting on disk.
+- Fixed a goal graph node that failed over and then succeeded carrying the dead attempt's error and claim metadata in the checkpoint.
 
 - Added the bundled `goal-graph` skill for decomposing a goal into tracked sub-work that resumes across turns and sessions.
 - Added goal-graph dispatch, running nodes that need a model as subagents and joining their results back into the graph.

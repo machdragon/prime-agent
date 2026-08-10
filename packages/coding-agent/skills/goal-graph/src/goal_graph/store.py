@@ -9,6 +9,7 @@ or a person can read it without going through the kernel.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import tempfile
@@ -41,7 +42,10 @@ def slug(raw: str) -> str:
     normalized = "-".join(part for part in normalized.split("-") if part)
     if not normalized:
         raise ValueError("graph name must contain at least one alphanumeric character")
-    return normalized[:80]
+    if len(normalized) > 80:
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+        return f"{normalized[:80]}-{digest}"
+    return normalized
 
 
 def graph_path(name: str, store_dir: str | Path | None = None) -> Path:

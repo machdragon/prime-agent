@@ -176,6 +176,28 @@ class ExpandTest(GraphTestCase):
         self.assertEqual(g.get(root.id).state, "failed")
         self.assertIn("cycle", g.get(root.id).error or "")
 
+    def test_expand_with_an_unstorable_child_fails_the_node_not_the_run(self) -> None:
+        register(
+            lambda ctx: Expand([Node(intent="bad child", fn="noop", args={"path": Path("/tmp")})]),
+            name="spawn_bad",
+        )
+        register(lambda ctx: Done("fine"), name="noop")
+        register(lambda ctx: Done("ok"), name="ok")
+
+        g = self.graph("unstorable-expand")
+        bad_root = g.add(Node(intent="spawn bad", fn="spawn_bad"))
+        sibling = g.add(Node(intent="sibling", fn="ok"))
+
+        report = run(g.run())
+
+        self.assertEqual(report.stopped, "complete")
+        self.assertEqual(g.get(bad_root.id).state, "failed")
+        self.assertIn("cannot be stored as JSON", g.get(bad_root.id).error or "")
+        self.assertEqual(g.get(sibling.id).state, "done")
+
+        reloaded = Graph.open("unstorable-expand", store_dir=self.store_dir)
+        self.assertEqual(reloaded.get(sibling.id).result, "ok")
+
 
 class FailureTest(GraphTestCase):
     def test_a_raising_body_fails_only_its_own_branch(self) -> None:
@@ -245,6 +267,11 @@ class ValidationTest(GraphTestCase):
         g = self.graph()
         with self.assertRaisesRegex(KeyError, "nope"):
             g.get("nope")
+
+    def test_add_rejects_unstorable_args(self) -> None:
+        g = self.graph()
+        with self.assertRaisesRegex(ValueError, "cannot be stored as JSON"):
+            g.add(Node(intent="bad", args={"bad": object()}))
 
 
 class TerminationTest(GraphTestCase):
@@ -372,6 +399,16 @@ class PersistenceTest(GraphTestCase):
         self.assertEqual(slug("Ship The Release!"), "ship-the-release")
         with self.assertRaisesRegex(ValueError, "alphanumeric"):
             slug("///")
+
+    def test_slug_truncated_names_with_a_shared_prefix_stay_distinct(self) -> None:
+        name_a = "a" * 80 + "extra-a"
+        name_b = "a" * 80 + "extra-b"
+        self.assertNotEqual(slug(name_a), slug(name_b))
+        self.assertNotEqual(graph_path(name_a), graph_path(name_b))
+
+    def test_slug_of_exactly_80_alphanumerics_is_unchanged(self) -> None:
+        exact_80 = "x" * 80
+        self.assertEqual(slug(exact_80), exact_80)
 
 
 if __name__ == "__main__":

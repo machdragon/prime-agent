@@ -41,6 +41,7 @@ from .model import (
     Outcome,
     Reject,
     assert_jsonable,
+    assert_storable,
     register,
     registered,
     resolve,
@@ -157,6 +158,7 @@ class Graph:
 
     def add(self, node: Node) -> Node:
         """Add one node. Its `needs` must already exist and must not form a cycle."""
+        assert_storable(node)
         self._check_additions([node])
         self._nodes[node.id] = node
         return node
@@ -312,6 +314,8 @@ class Graph:
             for child in outcome.children
         )
         try:
+            for child in children:
+                assert_storable(child)
             self._check_additions(children, extra_needs={node.id: {child.id for child in children}})
         except ValueError as exc:
             node.state = "failed"

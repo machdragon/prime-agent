@@ -223,3 +223,11 @@ def assert_jsonable(value: Any, node_id: str) -> None:
         json.dumps(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"node {node_id} produced a result that cannot be stored as JSON: {exc}") from None
+
+
+def assert_storable(node: Node) -> None:
+    """Check that a node can survive a save/reload cycle by serializing its dict."""
+    try:
+        json.dumps(node.to_dict())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"node {node.id} cannot be stored as JSON: {exc}") from None

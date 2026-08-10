@@ -124,7 +124,21 @@ A child cannot see or choose node ids. To order its children it gives one a
 keys are resolved to real ids here. Children are told to write their result to a
 temporary file and rename it into place, and a result that will not parse while
 the child is still running is retried rather than treated as a failure, so
-finished work is not discarded over timing.
+finished work is not discarded over timing. A child that names a cycle in its
+keys (a self-dependency, or two children naming each other) fails only the
+expanding node with a clear message rather than corrupting the graph; the
+message speaks of ids the child never saw, since keys are resolved before the
+cycle check.
+
+Each attempt writes its own result file (`<node>.<attempt>.json`), so a retry
+can never read the previous attempt's answer. Files from dead attempts are kept
+as evidence and are not cleaned up yet; a long-running graph with many failovers
+will accumulate them under `g.results_dir`. A spawn that is refused (a provider
+with no capacity) leaves its node open, and the budget slot it would have used
+is not re-filled until the next superstep, so a run with many refused spawns
+makes slower progress than `max_in_flight` suggests. The loop checkpoints once
+per pass that does work, after the join and dispatch, so join results applied in
+a pass are persisted before the next pass begins.
 
 ## API
 
@@ -137,7 +151,10 @@ finished work is not discarded over timing.
   — join finished children, run the frontier, dispatch model nodes, checkpoint,
   repeat until nothing is runnable. Returns a `RunReport` with `stopped`,
   `supersteps`, `executed`, `counts`, `pending_dispatch`, `in_flight`, and
-  `blocked`.
+  `blocked`. `stopped` prioritises in-flight children over pending dispatch, so
+  a graph with both may report `in_flight` while `pending_dispatch` is non-empty;
+  switch on both fields rather than treating the two reasons as mutually
+  exclusive.
 - `g.results_dir` — where dispatched children write results, beside the graph
   file.
 - `g.frontier()` — open nodes whose `needs` are all done.

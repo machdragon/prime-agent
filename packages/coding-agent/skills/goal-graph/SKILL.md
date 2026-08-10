@@ -74,13 +74,27 @@ survives the parent compacting or restarting first.
 ```python
 from goal_graph import Graph, Node, RlmDispatcher
 
-g = Graph.open("review", dispatcher=RlmDispatcher(default_model="opencode-go/glm-5.2"))
+dispatcher = RlmDispatcher(models=["opencode-go/glm-5.2", "devin-2/glm-5-2", "devin-1/glm-5-2"])
+g = Graph.open("review", dispatcher=dispatcher)
 g.add(Node(intent="review the diff", prompt="Review the staged diff and list defects."))
 
 report = await g.run()          # dispatches, then returns "in_flight"
 # ... the turn ends; when a child messages back:
 report = await g.run()          # joins whatever finished and keeps going
 ```
+
+`models` is an ordered fallback list. A provider that has run out of quota does
+not refuse the spawn, because its credentials are still valid: the child is
+admitted and then dies partway. So a child that stops without leaving a result
+reopens its node for the next model rather than failing it, and only an
+exhausted list fails the node. The last attempt's failure stays as the
+diagnosis. A node's own `model` leads and the rest remain as fallback. Each
+attempt writes its own result file, so a retry can never read the previous
+attempt's answer.
+
+`report.in_flight` carries the node id, intent, model, child id, and how long
+the attempt has been running, because a list of ids cannot tell a child that is
+working from one that has stopped responding.
 
 Pass `wait_seconds` to block in the cell instead of ending the turn. A child
 that the subagent registry reports as finished without leaving a result file

@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from .model import Done, Expand, Node, Outcome, Reject
 
@@ -37,29 +37,47 @@ class DispatchHandle:
 class Dispatcher(Protocol):
     """What the graph needs from a child runtime.
 
-    Narrow on purpose: it is the seam the capacity-aware router plugs into, and
-    the seam a test replaces without booting a session.
+    Narrow on purpose: it is the seam a capacity-aware router plugs into, and
+    the seam a test replaces without booting a session. `candidates` is that
+    seam: a router that reads remaining quota answers it differently without
+    the graph changing.
     """
 
-    async def spawn(self, node: Node, prompt: str) -> DispatchHandle: ...
+    def candidates(self, node: Node) -> tuple[str | None, ...]: ...
+
+    async def spawn(self, node: Node, prompt: str, model: str | None) -> DispatchHandle: ...
 
     async def statuses(self) -> dict[str, str]: ...
 
 
 class RlmDispatcher:
-    """The default dispatcher: one RLM child per model node."""
+    """The default dispatcher: one RLM child per model node.
 
-    def __init__(self, default_model: str | None = None) -> None:
-        self.default_model = default_model
+    `models` is an ordered fallback list. A provider that has run out of quota
+    does not fail at spawn, because its credentials are still valid; it fails
+    once the child stops without producing a result. So the list is what the
+    graph walks when an attempt dies, not just when one is refused.
+    """
 
-    async def spawn(self, node: Node, prompt: str) -> DispatchHandle:
+    def __init__(self, models: Sequence[str] | None = None, default_model: str | None = None) -> None:
+        configured: list[str] = list(models or ())
+        if default_model and default_model not in configured:
+            configured.insert(0, default_model)
+        self.models: tuple[str, ...] = tuple(configured)
+
+    def candidates(self, node: Node) -> tuple[str | None, ...]:
+        if node.model:
+            # The node's own choice leads; the rest stay available as fallback.
+            return (node.model, *(model for model in self.models if model != node.model))
+        return self.models or (None,)
+
+    async def spawn(self, node: Node, prompt: str, model: str | None) -> DispatchHandle:
         # Imported per call, not at module scope: `rlm` exists only inside the
         # Prime Agent kernel, and the rest of this package must stay importable
         # (and testable) outside one.
         import rlm
 
-        kwargs: dict[str, Any] = {"name": _child_name(node)}
-        model = node.model or self.default_model
+        kwargs: dict[str, Any] = {"name": child_name(node, len(node.tried_models))}
         if model:
             kwargs["model"] = model
         handle = await rlm.run(prompt, **kwargs)
@@ -71,14 +89,15 @@ class RlmDispatcher:
         return {child.rlm_child_id: child.status for child in await rlm.list_subagents()}
 
 
-def _child_name(node: Node) -> str:
-    # The registry rejects duplicate names, and a node is dispatched once, so
-    # the node id is both stable and unique.
-    return f"node-{node.id}"
+def child_name(node: Node, attempt: int) -> str:
+    # The registry rejects duplicate names, so a retry cannot reuse the first
+    # attempt's name.
+    return f"node-{node.id}-{attempt}"
 
 
-def result_path(results_dir: Path, node_id: str) -> Path:
-    return Path(results_dir) / f"{node_id}.json"
+def result_path(results_dir: Path, node_id: str, attempt: int) -> Path:
+    """One file per attempt, so a retry can never read the last attempt's result."""
+    return Path(results_dir) / f"{node_id}.{attempt}.json"
 
 
 def build_child_prompt(node: Node, path: Path) -> str:

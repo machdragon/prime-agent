@@ -49,6 +49,13 @@ class Node:
     #: Set when a model node is dispatched, so the join can tell a child that is
     #: still working from one that finished without leaving a result.
     child_id: str | None = None
+    #: Model selectors already attempted for this node. Both the retry, which
+    #: needs the next untried candidate, and a person reading the checkpoint
+    #: after a provider ran out, need to know what was tried.
+    tried_models: tuple[str, ...] = ()
+    #: Unix seconds the current attempt was dispatched, so a report can say how
+    #: long a child has been working rather than only that it has not finished.
+    claimed_at: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, str) or not self.intent.strip():
@@ -66,6 +73,7 @@ class Node:
             raise TypeError(f"node {self.id} args must be a dict, got {type(self.args).__name__}")
         self.needs = _id_tuple(self.needs, f"node {self.id} needs")
         self.parents = _id_tuple(self.parents, f"node {self.id} parents")
+        self.tried_models = _id_tuple(self.tried_models, f"node {self.id} tried_models")
         if self.id in self.needs:
             raise ValueError(f"node {self.id} cannot need itself")
 
@@ -92,6 +100,8 @@ class Node:
             "error": self.error,
             "reason": self.reason,
             "child_id": self.child_id,
+            "tried_models": list(self.tried_models),
+            "claimed_at": self.claimed_at,
         }
 
     @classmethod
@@ -113,6 +123,8 @@ class Node:
                 error=raw.get("error"),
                 reason=raw.get("reason"),
                 child_id=raw.get("child_id"),
+                tried_models=tuple(raw.get("tried_models") or ()),
+                claimed_at=raw.get("claimed_at"),
             )
         except KeyError as exc:
             raise ValueError(f"node record is missing {exc.args[0]!r}") from None

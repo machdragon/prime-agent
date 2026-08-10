@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Added fallback models to goal graph dispatch, so work whose provider runs out of quota is retried on the next model instead of failing.
+- Changed the goal graph run report to name the model, child, and elapsed time of each running sub-task, so a working one can be told from a stuck one.
+
 - Fixed a goal graph becoming permanently unreadable after a node that named a model was split into sub-steps.
 - Fixed sub-steps losing the model they asked for, and sub-step ordering being rejected outright.
 - Fixed a result read while it was still being written failing work that had actually succeeded.

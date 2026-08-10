@@ -18,20 +18,26 @@ def run(coro):
 class FakeDispatcher:
     """Stands in for RLM children: records spawns, reports registry statuses."""
 
-    def __init__(self, *, fail_spawn: bool = False) -> None:
-        self.spawns: list[tuple[Node, str]] = []
+    def __init__(self, *, fail_spawn: bool = False, models: tuple[str, ...] = ()) -> None:
+        self.spawns: list[tuple[Node, str, str | None]] = []
         self.status: dict[str, str] = {}
         self.fail_spawn = fail_spawn
+        self.models = models
         self.status_calls = 0
         self.on_status: Callable[[int], None] | None = None
 
-    async def spawn(self, node: Node, prompt: str) -> DispatchHandle:
+    def candidates(self, node: Node) -> tuple[str | None, ...]:
+        if node.model:
+            return (node.model, *(model for model in self.models if model != node.model))
+        return self.models or (None,)
+
+    async def spawn(self, node: Node, prompt: str, model: str | None) -> DispatchHandle:
         if self.fail_spawn:
             raise RuntimeError("no capacity")
-        self.spawns.append((node, prompt))
+        self.spawns.append((node, prompt, model))
         child_id = f"sub-{len(self.spawns)}"
         self.status[child_id] = "running"
-        return DispatchHandle(child_id=child_id, name=f"node-{node.id}", model=node.model or "fake/model")
+        return DispatchHandle(child_id=child_id, name=f"node-{node.id}", model=model or "fake/model")
 
     async def statuses(self) -> dict[str, str]:
         self.status_calls += 1
@@ -51,9 +57,9 @@ class DispatchTestCase(unittest.TestCase):
         chosen = self.dispatcher if dispatcher is ... else dispatcher
         return Graph.open(name, store_dir=self.store_dir, dispatcher=chosen)
 
-    def write_result(self, graph: Graph, node_id: str, payload: dict) -> None:
+    def write_result(self, graph: Graph, node_id: str, payload: dict, attempt: int = 0) -> None:
         graph.results_dir.mkdir(parents=True, exist_ok=True)
-        result_path(graph.results_dir, node_id).write_text(json.dumps(payload), encoding="utf-8")
+        result_path(graph.results_dir, node_id, attempt).write_text(json.dumps(payload), encoding="utf-8")
 
 
 class DispatchTest(DispatchTestCase):
@@ -64,7 +70,7 @@ class DispatchTest(DispatchTestCase):
         report = run(g.run())
 
         self.assertEqual(report.stopped, "in_flight")
-        self.assertEqual(report.in_flight, (node.id,))
+        self.assertEqual([entry.node_id for entry in report.in_flight], [node.id])
         self.assertEqual(g.get(node.id).state, "claimed")
         self.assertEqual(g.get(node.id).child_id, "sub-1")
         self.assertEqual(len(self.dispatcher.spawns), 1)
@@ -74,10 +80,10 @@ class DispatchTest(DispatchTestCase):
         node = g.add(Node(intent="think", prompt="the original instruction"))
         run(g.run())
 
-        _, prompt = self.dispatcher.spawns[0]
+        _, prompt, _ = self.dispatcher.spawns[0]
         self.assertIn("the original instruction", prompt)
         self.assertIn(node.id, prompt)
-        self.assertIn(str(result_path(g.results_dir, node.id)), prompt)
+        self.assertIn(str(result_path(g.results_dir, node.id, 0)), prompt)
 
     def test_a_done_result_is_joined_on_the_next_run(self) -> None:
         g = self.graph()
@@ -150,7 +156,7 @@ class DispatchTest(DispatchTestCase):
         run(g.run())
 
         self.assertEqual(g.get(model.id).state, "failed")
-        self.assertIn("dispatch failed: RuntimeError: no capacity", g.get(model.id).error or "")
+        self.assertIn("failed: RuntimeError: no capacity", g.get(model.id).error or "")
         self.assertEqual(g.get(inline.id).state, "done")
 
     def test_the_results_directory_sits_beside_the_graph_file(self) -> None:
@@ -169,6 +175,124 @@ class DispatchTest(DispatchTestCase):
         self.write_result(reloaded, node.id, {"outcome": "done", "result": "after reload"})
         self.assertTrue(run(reloaded.run()).complete)
         self.assertEqual(reloaded.get(node.id).result, "after reload")
+
+
+class FailoverTest(DispatchTestCase):
+    """A provider that runs out of quota does not refuse the spawn.
+
+    Its credentials stay valid, so the child is admitted and then dies partway.
+    That is what these cover: the failure arrives at the join, not at dispatch.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.dispatcher = FakeDispatcher(models=("opencode-go/glm-5.2", "devin-2/glm-5-2", "devin-1/glm-5-2"))
+
+    def test_a_child_that_dies_is_retried_on_the_next_model(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+        self.assertEqual(g.get(node.id).tried_models, ("opencode-go/glm-5.2",))
+
+        self.dispatcher.status["sub-1"] = "error"
+        report = run(g.run())
+
+        self.assertEqual(g.get(node.id).state, "claimed", "a dead provider is not a dead node")
+        self.assertEqual(g.get(node.id).tried_models, ("opencode-go/glm-5.2", "devin-2/glm-5-2"))
+        self.assertEqual(self.dispatcher.spawns[1][2], "devin-2/glm-5-2")
+        self.assertEqual(report.stopped, "in_flight")
+
+    def test_the_retry_succeeds_on_the_fallback(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+        self.dispatcher.status["sub-1"] = "error"
+        run(g.run())
+
+        # The second attempt writes to its own file, so the first cannot be read.
+        self.write_result(g, node.id, {"outcome": "done", "result": "from devin"}, attempt=1)
+        self.assertTrue(run(g.run()).complete)
+        self.assertEqual(g.get(node.id).result, "from devin")
+
+    def test_a_stale_result_from_a_dead_attempt_is_never_joined(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+        self.write_result(g, node.id, {"outcome": "done", "result": "stale"}, attempt=0)
+        self.dispatcher.status["sub-1"] = "error"
+        # The first attempt's file exists, so it is joined before the retry.
+        self.assertTrue(run(g.run()).complete)
+        self.assertEqual(g.get(node.id).result, "stale")
+
+    def test_the_node_fails_only_once_every_model_is_spent(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        for attempt in range(3):
+            run(g.run())
+            self.dispatcher.status[f"sub-{attempt + 1}"] = "error"
+        report = run(g.run())
+
+        self.assertEqual(g.get(node.id).state, "failed")
+        self.assertEqual(len(self.dispatcher.spawns), 3, "each model is tried once")
+        self.assertIn("no candidate model left to try", g.get(node.id).error or "")
+        self.assertIn("finished as error", g.get(node.id).error or "", "the last failure stays the diagnosis")
+        self.assertEqual(report.stopped, "complete")
+
+    def test_a_node_model_leads_and_the_rest_stay_as_fallback(self) -> None:
+        g = self.graph()
+        g.add(Node(intent="think", prompt="decide", model="devin-1/glm-5-2"))
+        run(g.run())
+        self.assertEqual(self.dispatcher.spawns[0][2], "devin-1/glm-5-2")
+
+        self.dispatcher.status["sub-1"] = "error"
+        run(g.run())
+        self.assertEqual(self.dispatcher.spawns[1][2], "opencode-go/glm-5.2")
+
+    def test_a_refused_spawn_moves_to_the_next_model_rather_than_failing(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        self.dispatcher.fail_spawn = True
+        run(g.run(max_supersteps=1))
+
+        self.assertEqual(g.get(node.id).state, "open", "another candidate may still be admitted")
+        self.assertEqual(g.get(node.id).tried_models, ("opencode-go/glm-5.2",))
+
+    def test_without_a_fallback_list_the_parent_model_is_tried_once(self) -> None:
+        self.dispatcher = FakeDispatcher()
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+        self.dispatcher.status["sub-1"] = "error"
+        run(g.run())
+
+        self.assertEqual(g.get(node.id).state, "failed")
+        self.assertEqual(len(self.dispatcher.spawns), 1, "there is no other model to fall back to")
+
+
+class VisibilityTest(DispatchTestCase):
+    def test_in_flight_reports_enough_to_tell_working_from_wedged(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="review the diff", prompt="decide", model="devin-2/glm-5-2"))
+        report = run(g.run())
+
+        entry = report.in_flight[0]
+        self.assertEqual(entry.node_id, node.id)
+        self.assertEqual(entry.intent, "review the diff")
+        self.assertEqual(entry.model, "devin-2/glm-5-2")
+        self.assertEqual(entry.child_id, "sub-1")
+        self.assertGreaterEqual(entry.seconds, 0.0)
+        self.assertEqual(report.to_dict()["in_flight"][0]["intent"], "review the diff")
+
+    def test_a_reopened_graph_with_no_dispatcher_says_it_is_detached(self) -> None:
+        g = self.graph("detach")
+        g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+
+        reopened = Graph.open("detach", store_dir=self.store_dir)
+        report = run(reopened.run())
+
+        self.assertEqual(report.stopped, "detached", "nothing here can adjudicate a child that died")
+        self.assertEqual(len(report.in_flight), 1)
 
 
 class ChildOutcomeTest(DispatchTestCase):
@@ -227,7 +351,7 @@ class ChildOutcomeTest(DispatchTestCase):
 
         run(g.run())
         self.assertEqual(len(g), 2)
-        self.assertTrue(result_path(g.results_dir, node.id).exists())
+        self.assertTrue(result_path(g.results_dir, node.id, 0).exists())
 
     def test_an_expanded_node_drops_the_body_it_no_longer_has(self) -> None:
         # `model` outliving `prompt` is a pairing Node rejects on load, so the
@@ -279,7 +403,7 @@ class ChildOutcomeTest(DispatchTestCase):
         build, test = children["build it"], children["test it"]
         self.assertEqual(test.needs, (build.id,), "a sibling key must resolve to the id assigned here")
         self.assertEqual(build.needs, ())
-        self.assertEqual(report.in_flight, (build.id,), "only the unblocked sibling is dispatched")
+        self.assertEqual([entry.node_id for entry in report.in_flight], [build.id], "only the unblocked sibling is dispatched")
 
     def test_a_child_expansion_can_name_a_registered_inline_body(self) -> None:
         register(lambda ctx: Done(ctx.args["n"] * 3), name="triple")
@@ -334,7 +458,7 @@ class ChildOutcomeTest(DispatchTestCase):
         node = g.add(Node(intent="think", prompt="decide"))
         run(g.run())
         g.results_dir.mkdir(parents=True, exist_ok=True)
-        result_path(g.results_dir, node.id).write_text('{"outcome": "do', encoding="utf-8")
+        result_path(g.results_dir, node.id, 0).write_text('{"outcome": "do', encoding="utf-8")
 
         report = run(g.run())
         self.assertEqual(g.get(node.id).state, "claimed", "a working child must not be failed over timing")
@@ -349,7 +473,7 @@ class ChildOutcomeTest(DispatchTestCase):
         node = g.add(Node(intent="think", prompt="decide"))
         run(g.run())
         g.results_dir.mkdir(parents=True, exist_ok=True)
-        result_path(g.results_dir, node.id).write_text("{not json", encoding="utf-8")
+        result_path(g.results_dir, node.id, 0).write_text("{not json", encoding="utf-8")
         self.dispatcher.status["sub-1"] = "completed"
 
         run(g.run())
@@ -416,7 +540,7 @@ class ResultParsingTest(unittest.TestCase):
             )
 
     def test_the_prompt_documents_keys_rather_than_ids(self) -> None:
-        prompt = build_child_prompt(self.node(), Path("/tmp/results/n_test.json"))
+        prompt = build_child_prompt(self.node(), Path("/tmp/results/n_test.0.json"))
         self.assertIn('"key"', prompt)
         self.assertIn("cannot see or set ids", prompt)
         self.assertIn("os.replace", prompt)
@@ -426,8 +550,8 @@ class ResultParsingTest(unittest.TestCase):
             parse_result(["done"], self.node())
 
     def test_the_prompt_states_the_protocol(self) -> None:
-        prompt = build_child_prompt(self.node(), Path("/tmp/results/n_test.json"))
-        self.assertIn("/tmp/results/n_test.json", prompt)
+        prompt = build_child_prompt(self.node(), Path("/tmp/results/n_test.0.json"))
+        self.assertIn("/tmp/results/n_test.0.json", prompt)
         self.assertIn('"outcome": "done"', prompt)
         self.assertIn("receiver_role=\"parent\"", prompt)
 

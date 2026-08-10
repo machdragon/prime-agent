@@ -32,6 +32,7 @@ import inspect
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import monotonic as _monotonic
+from time import time as _now
 from typing import Any, Iterable, Mapping
 
 from .dispatch import (
@@ -71,6 +72,7 @@ __all__ = [
     "Expand",
     "Graph",
     "GraphStore",
+    "InFlight",
     "InlineBody",
     "Node",
     "Outcome",
@@ -94,10 +96,36 @@ STOP_REASONS: tuple[str, ...] = (
     "complete",
     "pending_dispatch",
     "in_flight",
+    "detached",
     "blocked",
     "max_supersteps",
     "max_nodes",
 )
+
+
+@dataclass(frozen=True)
+class InFlight:
+    """One dispatched child, with enough to tell working from wedged.
+
+    A bare list of node ids cannot distinguish a child that is making progress
+    from one that has stopped responding, which is the thing you most need to
+    know while waiting.
+    """
+
+    node_id: str
+    intent: str
+    model: str | None
+    child_id: str | None
+    seconds: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "intent": self.intent,
+            "model": self.model,
+            "child_id": self.child_id,
+            "seconds": round(self.seconds, 1),
+        }
 
 
 @dataclass(frozen=True)
@@ -107,7 +135,7 @@ class RunReport:
     executed: int
     counts: Mapping[str, int]
     pending_dispatch: tuple[str, ...] = ()
-    in_flight: tuple[str, ...] = ()
+    in_flight: tuple[InFlight, ...] = ()
     blocked: tuple[str, ...] = ()
 
     @property
@@ -121,7 +149,7 @@ class RunReport:
             "executed": self.executed,
             "counts": dict(self.counts),
             "pending_dispatch": list(self.pending_dispatch),
-            "in_flight": list(self.in_flight),
+            "in_flight": [entry.to_dict() for entry in self.in_flight],
             "blocked": list(self.blocked),
         }
 
@@ -307,7 +335,7 @@ class Graph:
             executed=executed,
             counts=self.counts(),
             pending_dispatch=tuple(node.id for node in self.frontier() if node.kind == "model"),
-            in_flight=tuple(node.id for node in self._in_flight()),
+            in_flight=tuple(self._in_flight_report()),
             blocked=tuple(node.id for node in self.blocked()),
         )
 
@@ -331,7 +359,7 @@ class Graph:
 
         resolved = 0
         for node in claimed:
-            path = result_path(self.results_dir, node.id)
+            path = result_path(self.results_dir, node.id, max(0, len(node.tried_models) - 1))
             if path.exists():
                 try:
                     outcome = parse_result(read_result(path), node)
@@ -349,23 +377,67 @@ class Graph:
                 continue
             status = await status_of(node)
             if status in (CHILD_COMPLETED, CHILD_ERROR):
-                node.state = "failed"
-                node.error = f"child {node.child_id} finished as {status} without writing {path}"
+                # A child that stopped without a result usually means the
+                # provider gave out rather than the work being wrong, which is
+                # what a quota-exhausted provider looks like from here: the
+                # spawn is accepted because the credentials are still valid, and
+                # the child dies partway. So the node reopens for the next
+                # candidate model, and only an exhausted list fails it.
+                node.error = (
+                    f"child {node.child_id} on {node.tried_models[-1] if node.tried_models else 'the parent model'} "
+                    f"finished as {status} without writing {path}"
+                )
+                node.state = "open"
+                node.child_id = None
+                node.claimed_at = None
                 resolved += 1
         return resolved
 
     async def _dispatch(self, node: Node) -> None:
-        path = result_path(self.results_dir, node.id)
         assert self._dispatcher is not None
+        remaining = [model for model in self._dispatcher.candidates(node) if _untried(model, node)]
+        if not remaining:
+            node.state = "failed"
+            # The last attempt's reason is the diagnosis; exhaustion is only the
+            # reason there will not be another one.
+            exhausted = f"no candidate model left to try (tried {', '.join(node.tried_models) or 'the parent model'})"
+            node.error = f"{node.error}; {exhausted}" if node.error else exhausted
+            return
+
+        model = remaining[0]
+        attempt = len(node.tried_models)
+        path = result_path(self.results_dir, node.id, attempt)
         try:
             self.results_dir.mkdir(parents=True, exist_ok=True)
-            handle = await self._dispatcher.spawn(node, build_child_prompt(node, path))
+            handle = await self._dispatcher.spawn(node, build_child_prompt(node, path), model)
         except Exception as exc:
-            node.state = "failed"
-            node.error = f"dispatch failed: {type(exc).__name__}: {exc}"
+            node.error = f"dispatch on {model or 'the parent model'} failed: {type(exc).__name__}: {exc}"
+            if model is None:
+                # Nothing was requested, so there is no other model to fall back to.
+                node.state = "failed"
+                return
+            # Left open: the next superstep tries the next candidate, and an
+            # exhausted list is what finally fails the node.
+            node.tried_models = (*node.tried_models, model)
             return
+
         node.state = "claimed"
         node.child_id = handle.child_id
+        node.claimed_at = _now()
+        node.tried_models = (*node.tried_models, model or handle.model)
+
+    def _in_flight_report(self) -> list[InFlight]:
+        now = _now()
+        return [
+            InFlight(
+                node_id=node.id,
+                intent=node.intent,
+                model=node.tried_models[-1] if node.tried_models else None,
+                child_id=node.child_id,
+                seconds=max(0.0, now - node.claimed_at) if node.claimed_at else 0.0,
+            )
+            for node in self._in_flight()
+        ]
 
     def _in_flight(self) -> list[Node]:
         return [node for node in self._nodes.values() if node.state == "claimed"]
@@ -399,7 +471,10 @@ class Graph:
 
     def _terminal_reason(self, frontier: list[Node]) -> str:
         if self._in_flight():
-            return "in_flight"
+            # Without a dispatcher nothing can adjudicate a child that died, so
+            # these nodes can only ever resolve if a result file appears.
+            # Calling that "in_flight" would imply someone is still working.
+            return "in_flight" if self._dispatcher is not None else "detached"
         if any(node.kind == "model" for node in frontier):
             return "pending_dispatch"
         if any(node.state == "open" for node in self._nodes.values()):
@@ -508,6 +583,15 @@ class Graph:
         if unknown:
             raise ValueError(f"graph {self.name!r} references unknown nodes: {unknown}")
         _assert_acyclic(adjacency)
+
+
+def _untried(model: str | None, node: Node) -> bool:
+    """A named model is untried until it appears in `tried_models`.
+
+    `None` means "whatever the parent is using", which is one attempt and has no
+    alternative to fall back to, so it is untried only before anything ran.
+    """
+    return not node.tried_models if model is None else model not in node.tried_models
 
 
 def _assert_acyclic(adjacency: Mapping[str, set[str]]) -> None:

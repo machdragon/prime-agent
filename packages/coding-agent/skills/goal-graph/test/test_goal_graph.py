@@ -221,6 +221,36 @@ class FailureTest(GraphTestCase):
         self.assertEqual(report.stopped, "blocked")
         self.assertEqual(report.blocked, (downstream.id,))
 
+    def test_blocked_reports_transitively_stuck_nodes(self) -> None:
+        def boom(ctx):
+            raise RuntimeError("no")
+
+        register(boom, name="boom2")
+        register(lambda ctx: Done("fine"), name="fine2")
+
+        g = self.graph()
+        bad = g.add(Node(intent="bad", fn="boom2"))
+        near = g.add(Node(intent="one hop", fn="fine2", needs=(bad.id,)))
+        far = g.add(Node(intent="two hops", fn="fine2", needs=(near.id,)))
+        unrelated = g.add(Node(intent="unrelated", fn="fine2"))
+
+        report = run(g.run())
+
+        self.assertEqual(report.stopped, "blocked")
+        self.assertEqual(sorted(report.blocked), sorted([near.id, far.id]))
+        self.assertEqual(g.get(unrelated.id).state, "done")
+
+    def test_a_rejected_dependency_also_blocks_downstream(self) -> None:
+        register(lambda ctx: Reject("wrong approach"), name="nope")
+        register(lambda ctx: Done("fine"), name="fine3")
+        g = self.graph()
+        rejected = g.add(Node(intent="try", fn="nope"))
+        downstream = g.add(Node(intent="after", fn="fine3", needs=(rejected.id,)))
+
+        report = run(g.run())
+
+        self.assertEqual(report.blocked, (downstream.id,))
+
     def test_reject_keeps_the_branch_and_its_reason(self) -> None:
         register(lambda ctx: Reject("the API does not support it"), name="no")
         g = self.graph()

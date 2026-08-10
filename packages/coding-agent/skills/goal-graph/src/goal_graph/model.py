@@ -38,6 +38,7 @@ class Node:
     id: str = field(default_factory=new_node_id)
     fn: str | None = None
     prompt: str | None = None
+    model: str | None = None
     args: dict[str, Any] = field(default_factory=dict)
     needs: tuple[str, ...] = ()
     parents: tuple[str, ...] = ()
@@ -45,6 +46,16 @@ class Node:
     result: Any = None
     error: str | None = None
     reason: str | None = None
+    #: Set when a model node is dispatched, so the join can tell a child that is
+    #: still working from one that finished without leaving a result.
+    child_id: str | None = None
+    #: Model selectors already attempted for this node. Both the retry, which
+    #: needs the next untried candidate, and a person reading the checkpoint
+    #: after a provider ran out, need to know what was tried.
+    tried_models: tuple[str, ...] = ()
+    #: Unix seconds the current attempt was dispatched, so a report can say how
+    #: long a child has been working rather than only that it has not finished.
+    claimed_at: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, str) or not self.intent.strip():
@@ -54,12 +65,15 @@ class Node:
             raise ValueError("node id must be a non-empty string")
         if self.fn is not None and self.prompt is not None:
             raise ValueError(f"node {self.id} sets both fn and prompt; a node has one body")
+        if self.model is not None and self.prompt is None:
+            raise ValueError(f"node {self.id} names a model but has no prompt to run with it")
         if self.state not in NODE_STATES:
             raise ValueError(f"node {self.id} has unknown state {self.state!r}")
         if not isinstance(self.args, dict):
             raise TypeError(f"node {self.id} args must be a dict, got {type(self.args).__name__}")
         self.needs = _id_tuple(self.needs, f"node {self.id} needs")
         self.parents = _id_tuple(self.parents, f"node {self.id} parents")
+        self.tried_models = _id_tuple(self.tried_models, f"node {self.id} tried_models")
         if self.id in self.needs:
             raise ValueError(f"node {self.id} cannot need itself")
 
@@ -78,12 +92,16 @@ class Node:
             "state": self.state,
             "fn": self.fn,
             "prompt": self.prompt,
+            "model": self.model,
             "args": self.args,
             "needs": list(self.needs),
             "parents": list(self.parents),
             "result": self.result,
             "error": self.error,
             "reason": self.reason,
+            "child_id": self.child_id,
+            "tried_models": list(self.tried_models),
+            "claimed_at": self.claimed_at,
         }
 
     @classmethod
@@ -96,6 +114,7 @@ class Node:
                 id=raw["id"],
                 fn=raw.get("fn"),
                 prompt=raw.get("prompt"),
+                model=raw.get("model"),
                 args=dict(raw.get("args") or {}),
                 needs=tuple(raw.get("needs") or ()),
                 parents=tuple(raw.get("parents") or ()),
@@ -103,6 +122,9 @@ class Node:
                 result=raw.get("result"),
                 error=raw.get("error"),
                 reason=raw.get("reason"),
+                child_id=raw.get("child_id"),
+                tried_models=tuple(raw.get("tried_models") or ()),
+                claimed_at=raw.get("claimed_at"),
             )
         except KeyError as exc:
             raise ValueError(f"node record is missing {exc.args[0]!r}") from None

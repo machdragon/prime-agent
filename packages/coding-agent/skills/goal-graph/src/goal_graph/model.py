@@ -38,6 +38,7 @@ class Node:
     id: str = field(default_factory=new_node_id)
     fn: str | None = None
     prompt: str | None = None
+    model: str | None = None
     args: dict[str, Any] = field(default_factory=dict)
     needs: tuple[str, ...] = ()
     parents: tuple[str, ...] = ()
@@ -45,6 +46,9 @@ class Node:
     result: Any = None
     error: str | None = None
     reason: str | None = None
+    #: Set when a model node is dispatched, so the join can tell a child that is
+    #: still working from one that finished without leaving a result.
+    child_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, str) or not self.intent.strip():
@@ -54,6 +58,8 @@ class Node:
             raise ValueError("node id must be a non-empty string")
         if self.fn is not None and self.prompt is not None:
             raise ValueError(f"node {self.id} sets both fn and prompt; a node has one body")
+        if self.model is not None and self.prompt is None:
+            raise ValueError(f"node {self.id} names a model but has no prompt to run with it")
         if self.state not in NODE_STATES:
             raise ValueError(f"node {self.id} has unknown state {self.state!r}")
         if not isinstance(self.args, dict):
@@ -78,12 +84,14 @@ class Node:
             "state": self.state,
             "fn": self.fn,
             "prompt": self.prompt,
+            "model": self.model,
             "args": self.args,
             "needs": list(self.needs),
             "parents": list(self.parents),
             "result": self.result,
             "error": self.error,
             "reason": self.reason,
+            "child_id": self.child_id,
         }
 
     @classmethod
@@ -96,6 +104,7 @@ class Node:
                 id=raw["id"],
                 fn=raw.get("fn"),
                 prompt=raw.get("prompt"),
+                model=raw.get("model"),
                 args=dict(raw.get("args") or {}),
                 needs=tuple(raw.get("needs") or ()),
                 parents=tuple(raw.get("parents") or ()),
@@ -103,6 +112,7 @@ class Node:
                 result=raw.get("result"),
                 error=raw.get("error"),
                 reason=raw.get("reason"),
+                child_id=raw.get("child_id"),
             )
         except KeyError as exc:
             raise ValueError(f"node record is missing {exc.args[0]!r}") from None

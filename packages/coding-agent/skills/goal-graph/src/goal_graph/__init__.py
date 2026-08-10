@@ -27,10 +27,24 @@ A run ends when the frontier is empty, not when a continuation counter expires.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass
+from pathlib import Path
+from time import monotonic as _monotonic
 from typing import Any, Iterable, Mapping
 
+from .dispatch import (
+    CHILD_COMPLETED,
+    CHILD_ERROR,
+    DispatchHandle,
+    Dispatcher,
+    RlmDispatcher,
+    build_child_prompt,
+    parse_result,
+    read_result,
+    result_path,
+)
 from .model import (
     NODE_STATES,
     Context,
@@ -46,10 +60,12 @@ from .model import (
     registered,
     resolve,
 )
-from .store import STORE_VERSION, GraphStore, default_store_dir, graph_path
+from .store import STORE_VERSION, GraphStore, default_store_dir, graph_path, results_dir
 
 __all__ = [
     "Context",
+    "DispatchHandle",
+    "Dispatcher",
     "Done",
     "Expand",
     "Graph",
@@ -58,6 +74,7 @@ __all__ = [
     "Node",
     "Outcome",
     "Reject",
+    "RlmDispatcher",
     "RunReport",
     "default_store_dir",
     "graph_path",
@@ -68,11 +85,14 @@ __all__ = [
 
 DEFAULT_MAX_SUPERSTEPS = 10_000
 DEFAULT_MAX_NODES = 10_000
+DEFAULT_MAX_IN_FLIGHT = 4
+DEFAULT_POLL_SECONDS = 2.0
 
 #: Why `run()` returned. Only "complete" means the graph has nothing left to do.
 STOP_REASONS: tuple[str, ...] = (
     "complete",
     "pending_dispatch",
+    "in_flight",
     "blocked",
     "max_supersteps",
     "max_nodes",
@@ -86,6 +106,7 @@ class RunReport:
     executed: int
     counts: Mapping[str, int]
     pending_dispatch: tuple[str, ...] = ()
+    in_flight: tuple[str, ...] = ()
     blocked: tuple[str, ...] = ()
 
     @property
@@ -99,6 +120,7 @@ class RunReport:
             "executed": self.executed,
             "counts": dict(self.counts),
             "pending_dispatch": list(self.pending_dispatch),
+            "in_flight": list(self.in_flight),
             "blocked": list(self.blocked),
         }
 
@@ -106,28 +128,44 @@ class RunReport:
 class Graph:
     """A goal graph and the loop that runs it."""
 
-    def __init__(self, name: str, store: GraphStore, nodes: Iterable[Node] = ()) -> None:
+    def __init__(
+        self,
+        name: str,
+        store: GraphStore,
+        nodes: Iterable[Node] = (),
+        *,
+        dispatcher: Dispatcher | None = None,
+    ) -> None:
         self.name = name
         self._store = store
+        self._dispatcher = dispatcher
         self._nodes: dict[str, Node] = {}
         for node in nodes:
             self._nodes[node.id] = node
 
     @classmethod
-    def open(cls, name: str, *, store_dir: str | None = None) -> Graph:
-        """Load the named graph, or start an empty one under the same name."""
+    def open(cls, name: str, *, store_dir: str | None = None, dispatcher: Dispatcher | None = None) -> Graph:
+        """Load the named graph, or start an empty one under the same name.
+
+        Without a dispatcher, model nodes are reported as pending rather than
+        run, which is the whole behaviour when no child runtime is available.
+        """
         store = GraphStore(graph_path(name, store_dir))
         payload = store.read()
         if payload is None:
-            return cls(name, store)
+            return cls(name, store, dispatcher=dispatcher)
         nodes = [Node.from_dict(record) for record in payload.get("nodes", ())]
-        graph = cls(payload.get("name", name), store, nodes)
+        graph = cls(payload.get("name", name), store, nodes, dispatcher=dispatcher)
         graph._assert_consistent()
         return graph
 
     @property
     def path(self) -> str:
         return str(self._store.path)
+
+    @property
+    def results_dir(self) -> Path:
+        return results_dir(self._store.path)
 
     def __len__(self) -> int:
         return len(self._nodes)
@@ -181,36 +219,65 @@ class Graph:
         *,
         max_supersteps: int = DEFAULT_MAX_SUPERSTEPS,
         max_nodes: int = DEFAULT_MAX_NODES,
+        max_in_flight: int = DEFAULT_MAX_IN_FLIGHT,
+        wait_seconds: float = 0.0,
+        poll_seconds: float = DEFAULT_POLL_SECONDS,
         save: bool = True,
     ) -> RunReport:
         """Run the frontier until nothing is runnable.
 
-        Each superstep executes every runnable inline and collector node, then
-        checkpoints. Model nodes are left for the dispatcher and reported as
-        pending. Limits are safety rails: reaching one is not completion.
+        Each superstep joins whatever children have finished, executes every
+        runnable inline and collector node, dispatches model nodes up to
+        `max_in_flight`, then checkpoints.
+
+        With `wait_seconds=0` the run returns `"in_flight"` as soon as it is
+        waiting only on children, so the turn ends and the children keep going.
+        Call `run()` again when one messages back, or pass `wait_seconds` to
+        block here instead. Limits are safety rails: reaching one is not
+        completion.
         """
         if max_supersteps < 1:
             raise ValueError("max_supersteps must be at least 1")
         if max_nodes < 1:
             raise ValueError("max_nodes must be at least 1")
+        if max_in_flight < 1:
+            raise ValueError("max_in_flight must be at least 1")
+        if poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
 
         supersteps = 0
         executed = 0
         stopped = "complete"
+        deadline = _monotonic() + max(0.0, wait_seconds)
 
         while True:
-            frontier = self.frontier()
-            batch = [node for node in frontier if node.kind != "model"]
-            if not batch:
-                stopped = self._terminal_reason(frontier)
-                break
+            # Checked before any work, including a join, so max_supersteps bounds
+            # every path through the loop and a defect reports instead of hanging.
             if supersteps >= max_supersteps:
                 stopped = "max_supersteps"
                 break
+            joined = await self._ingest()
+            frontier = self.frontier()
+            inline = [node for node in frontier if node.kind != "model"]
+            dispatchable = self._dispatchable(frontier, max_in_flight)
+
+            if not inline and not dispatchable:
+                if joined:
+                    supersteps += 1
+                    continue
+                # Waiting is not work, so it does not spend the superstep budget.
+                if self._in_flight() and _monotonic() < deadline:
+                    await asyncio.sleep(min(poll_seconds, max(0.0, deadline - _monotonic())))
+                    continue
+                stopped = self._terminal_reason(frontier)
+                break
+
             supersteps += 1
-            for node in batch:
+            for node in inline:
                 await self._execute(node)
                 executed += 1
+            for node in dispatchable:
+                await self._dispatch(node)
             if save:
                 self.save()
             if len(self._nodes) > max_nodes:
@@ -225,8 +292,66 @@ class Graph:
             executed=executed,
             counts=self.counts(),
             pending_dispatch=tuple(node.id for node in self.frontier() if node.kind == "model"),
+            in_flight=tuple(node.id for node in self._in_flight()),
             blocked=tuple(node.id for node in self.blocked()),
         )
+
+    async def _ingest(self) -> int:
+        """Join finished children. Returns how many claimed nodes were resolved.
+
+        A result file is the outcome. A child the registry reports as finished
+        without one did not follow the protocol, and its node fails saying so
+        rather than holding the graph open forever.
+        """
+        claimed = self._in_flight()
+        if not claimed:
+            return 0
+        statuses: dict[str, str] | None = None
+        resolved = 0
+        for node in claimed:
+            path = result_path(self.results_dir, node.id)
+            if path.exists():
+                try:
+                    outcome = parse_result(read_result(path), node)
+                except ValueError as exc:
+                    node.state = "failed"
+                    node.error = str(exc)
+                else:
+                    self._apply(node, outcome)
+                resolved += 1
+                continue
+            if statuses is None and self._dispatcher is not None:
+                statuses = await self._dispatcher.statuses()
+            status = (statuses or {}).get(node.child_id or "")
+            if status in (CHILD_COMPLETED, CHILD_ERROR):
+                node.state = "failed"
+                node.error = f"child {node.child_id} finished as {status} without writing {path}"
+                resolved += 1
+        return resolved
+
+    async def _dispatch(self, node: Node) -> None:
+        path = result_path(self.results_dir, node.id)
+        assert self._dispatcher is not None
+        try:
+            self.results_dir.mkdir(parents=True, exist_ok=True)
+            handle = await self._dispatcher.spawn(node, build_child_prompt(node, path))
+        except Exception as exc:
+            node.state = "failed"
+            node.error = f"dispatch failed: {type(exc).__name__}: {exc}"
+            return
+        node.state = "claimed"
+        node.child_id = handle.child_id
+
+    def _in_flight(self) -> list[Node]:
+        return [node for node in self._nodes.values() if node.state == "claimed"]
+
+    def _dispatchable(self, frontier: list[Node], max_in_flight: int) -> list[Node]:
+        if self._dispatcher is None:
+            return []
+        budget = max_in_flight - len(self._in_flight())
+        if budget <= 0:
+            return []
+        return [node for node in frontier if node.kind == "model"][:budget]
 
     def save(self) -> None:
         """Checkpoint the graph.
@@ -248,9 +373,11 @@ class Graph:
         return all(self._nodes[need].state == "done" for need in node.needs)
 
     def _terminal_reason(self, frontier: list[Node]) -> str:
+        if self._in_flight():
+            return "in_flight"
         if any(node.kind == "model" for node in frontier):
             return "pending_dispatch"
-        if any(node.state in ("open", "claimed") for node in self._nodes.values()):
+        if any(node.state == "open" for node in self._nodes.values()):
             return "blocked"
         return "complete"
 
@@ -326,8 +453,12 @@ class Graph:
         node.needs = tuple(dict.fromkeys((*node.needs, *(child.id for child in children))))
         node.fn = outcome.then
         node.prompt = None
-        # The node stays open: it runs again once its new barrier releases, and
-        # `then` may expand again, which is what makes decomposition unbounded.
+        # Set explicitly rather than left alone: an expansion arriving from a
+        # dispatched child finds the node claimed, and a node that stays claimed
+        # is never runnable and has its result file re-read forever.
+        node.state = "open"
+        # It runs again once its new barrier releases, and `then` may expand
+        # again, which is what makes decomposition unbounded.
 
     def _check_additions(self, additions: Iterable[Node], extra_needs: Mapping[str, set[str]] | None = None) -> None:
         additions = list(additions)

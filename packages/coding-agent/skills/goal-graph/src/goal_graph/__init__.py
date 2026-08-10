@@ -206,13 +206,27 @@ class Graph:
         return [node for node in self._nodes.values() if node.state == "open" and self._deps_done(node)]
 
     def blocked(self) -> list[Node]:
-        """Open nodes that can never run because a dependency failed or was rejected."""
-        return [
-            node
-            for node in self._nodes.values()
-            if node.state == "open"
-            and any(self._nodes[need].state in ("failed", "rejected") for need in node.needs)
-        ]
+        """Open nodes that can never run because something upstream failed.
+
+        Transitive, not direct: a node two hops downstream of a failure is just
+        as unrunnable, and a report that stops with "blocked" while listing
+        nothing is worse than no report.
+        """
+        doomed = {
+            node_id for node_id, node in self._nodes.items() if node.state in ("failed", "rejected")
+        }
+        while True:
+            newly = {
+                node_id
+                for node_id, node in self._nodes.items()
+                if node.state == "open"
+                and node_id not in doomed
+                and any(need in doomed for need in node.needs)
+            }
+            if not newly:
+                break
+            doomed |= newly
+        return [node for node_id, node in self._nodes.items() if node_id in doomed and node.state == "open"]
 
     async def run(
         self,

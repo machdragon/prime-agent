@@ -64,11 +64,22 @@ path, so a symlink to it works.
 Install it as `prime-agent` on PATH:
 
 ```bash
-brew uninstall prime-agent    # only once, if the Homebrew release is present
 ln -sf ~/Projects/prime-agent/packages/coding-agent/dist/bundle/cli.js \
        ~/.local/bin/prime-agent
 prime-agent --version         # expect the date version
 ```
+
+`~/.local/bin` comes before `/opt/homebrew/bin` on PATH, so the symlink wins
+immediately and you can verify it before removing anything. Once it is working:
+
+```bash
+npm uninstall -g prime-agent  # the released 0.7.1, if still installed
+```
+
+The release was **not** a Homebrew formula. `brew list prime-agent` finds
+nothing; it was `npm install -g prime-agent` run with Homebrew's npm, which is
+why it lived under `/opt/homebrew/lib/node_modules/`. `brew uninstall` will not
+remove it.
 
 `~/.local/bin` already holds `prime-general` and `prime-personal`, which exec
 `prime-agent` from PATH, so both profiles follow the symlink with no further
@@ -76,11 +87,11 @@ change.
 
 A symlink rather than `npm link` or a global install: the fork is rebuilt often,
 and a symlink means `npm run build` is the whole deployment step. The cost is
-that a broken build is live immediately, which is why `npm run check` and
-`npm test` come before it.
+that a broken build is live immediately, which is why `npm run check` and the
+tests come before it.
 
-Homebrew is no longer the update path. `brew upgrade` will not touch this, and
-the in-app update check has nothing to upgrade to.
+The npm global install is no longer the update path, and the in-app update check
+has nothing to upgrade to.
 
 ## Running from source
 

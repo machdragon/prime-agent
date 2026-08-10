@@ -42,9 +42,9 @@ A node has exactly one body:
 - **inline**: `fn` names a callable registered with `@register`. It runs in this
   kernel. An inline node costs approximately nothing, which is what makes deep
   decomposition affordable.
-- **model**: `prompt` is set. Running it needs a model. `run()` does not execute
-  these; it reports them in `report.pending_dispatch` and stops with
-  `"pending_dispatch"`.
+- **model**: `prompt` is set. Running it needs a model, so it is dispatched to an
+  RLM child. Without a dispatcher it is reported in `report.pending_dispatch`
+  instead. `model` may name a `provider/model` selector for that child.
 - **collector**: neither is set. The node completes with the list of its `needs`
   results, in `needs` order. Use it for a milestone or a join.
 
@@ -63,16 +63,47 @@ dependency id to result), and `args`. It may be sync or async. It returns:
 A body that raises marks its node `failed` with the exception text. Other
 branches keep running; nodes downstream of the failure become blocked.
 
+## Dispatching model nodes
+
+`rlm()` returns an admission handle, never the child's answer, so the join is
+built here. Each dispatched node names a result file; the child writes it and
+sends one short line to its parent. The message is only a wake-up, the file is
+the result. That keeps a large result out of the 16KB agent-message cap and
+survives the parent compacting or restarting first.
+
+```python
+from goal_graph import Graph, Node, RlmDispatcher
+
+g = Graph.open("review", dispatcher=RlmDispatcher(default_model="opencode-go/glm-5.2"))
+g.add(Node(intent="review the diff", prompt="Review the staged diff and list defects."))
+
+report = await g.run()          # dispatches, then returns "in_flight"
+# ... the turn ends; when a child messages back:
+report = await g.run()          # joins whatever finished and keeps going
+```
+
+Pass `wait_seconds` to block in the cell instead of ending the turn. A child
+that the subagent registry reports as finished without leaving a result file
+fails its node saying so, rather than holding the graph open forever.
+
+A dispatched child may itself return `expand`, so decomposition is available at
+any depth, not only to whatever created the graph. Its children may name an `fn`
+registered in this kernel.
+
 ## API
 
-- `Graph.open(name, store_dir=None)` — load the named graph or start an empty
-  one.
+- `Graph.open(name, store_dir=None, dispatcher=None)` — load the named graph or
+  start an empty one. Without a dispatcher, model nodes are reported rather than
+  run.
 - `g.add(node)` — add one node. Its `needs` must already exist and must not form
   a cycle.
-- `await g.run(max_supersteps=10000, max_nodes=10000, save=True)` — run the
-  frontier until nothing is runnable, checkpointing after each superstep.
-  Returns a `RunReport` with `stopped`, `supersteps`, `executed`, `counts`,
-  `pending_dispatch`, and `blocked`.
+- `await g.run(max_supersteps=10000, max_nodes=10000, max_in_flight=4, wait_seconds=0, poll_seconds=2, save=True)`
+  — join finished children, run the frontier, dispatch model nodes, checkpoint,
+  repeat until nothing is runnable. Returns a `RunReport` with `stopped`,
+  `supersteps`, `executed`, `counts`, `pending_dispatch`, `in_flight`, and
+  `blocked`.
+- `g.results_dir` — where dispatched children write results, beside the graph
+  file.
 - `g.frontier()` — open nodes whose `needs` are all done.
 - `g.blocked()` — open nodes with a failed or rejected dependency.
 - `g.children_of(node_id)` — derived from `parents`, never stored.
@@ -80,9 +111,9 @@ branches keep running; nodes downstream of the failure become blocked.
 
 ## Rules
 
-- A run ends when the frontier is empty. `max_supersteps` and `max_nodes` are
-  safety limits; hitting one is reported as its own stop reason and is not
-  completion.
+- A run ends when the frontier is empty. `max_supersteps`, `max_nodes`, and
+  `in_flight` are reported as their own stop reasons and are not completion.
+  Only `stopped == "complete"` means there is nothing left to do.
 - Register bodies by name and keep them importable. A node stores the name, not
   the function, so a graph reloads after a kernel restart. A missing body fails
   that node with a clear message rather than corrupting the graph.

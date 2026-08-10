@@ -53,6 +53,12 @@ def graph_path(name: str, store_dir: str | Path | None = None) -> Path:
     return root / f"{slug(name)}.json"
 
 
+def results_dir(path: str | Path) -> Path:
+    """Where dispatched children leave their results, beside the graph file."""
+    path = Path(path)
+    return path.with_name(f"{path.stem}.results")
+
+
 class GraphStore:
     """Locked, atomically replaced JSON file holding one graph."""
 

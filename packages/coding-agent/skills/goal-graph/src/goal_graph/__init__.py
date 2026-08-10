@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Any, Iterable, Mapping
@@ -37,6 +37,7 @@ from typing import Any, Iterable, Mapping
 from .dispatch import (
     CHILD_COMPLETED,
     CHILD_ERROR,
+    CHILD_RUNNING,
     DispatchHandle,
     Dispatcher,
     RlmDispatcher,
@@ -321,6 +322,13 @@ class Graph:
         if not claimed:
             return 0
         statuses: dict[str, str] | None = None
+
+        async def status_of(node: Node) -> str | None:
+            nonlocal statuses
+            if statuses is None and self._dispatcher is not None:
+                statuses = await self._dispatcher.statuses()
+            return (statuses or {}).get(node.child_id or "")
+
         resolved = 0
         for node in claimed:
             path = result_path(self.results_dir, node.id)
@@ -328,15 +336,18 @@ class Graph:
                 try:
                     outcome = parse_result(read_result(path), node)
                 except ValueError as exc:
+                    # A child still working may be mid-write. Failing it here
+                    # would discard finished work over timing, so only a child
+                    # that has stopped can be blamed for what its file contains.
+                    if await status_of(node) == CHILD_RUNNING:
+                        continue
                     node.state = "failed"
                     node.error = str(exc)
                 else:
                     self._apply(node, outcome)
                 resolved += 1
                 continue
-            if statuses is None and self._dispatcher is not None:
-                statuses = await self._dispatcher.statuses()
-            status = (statuses or {}).get(node.child_id or "")
+            status = await status_of(node)
             if status in (CHILD_COMPLETED, CHILD_ERROR):
                 node.state = "failed"
                 node.error = f"child {node.child_id} finished as {status} without writing {path}"
@@ -438,20 +449,10 @@ class Graph:
             node.result = outcome.result
             return
 
+        # `replace` rather than listing fields: parentage is the only thing being
+        # changed, and a hand-written copy silently drops every field added later.
         children = tuple(
-            Node(
-                intent=child.intent,
-                id=child.id,
-                fn=child.fn,
-                prompt=child.prompt,
-                args=dict(child.args),
-                needs=child.needs,
-                parents=tuple(dict.fromkeys((*child.parents, node.id))),
-                state=child.state,
-                result=child.result,
-                error=child.error,
-                reason=child.reason,
-            )
+            replace(child, args=dict(child.args), parents=tuple(dict.fromkeys((*child.parents, node.id))))
             for child in outcome.children
         )
         try:
@@ -466,7 +467,13 @@ class Graph:
             self._nodes[child.id] = child
         node.needs = tuple(dict.fromkeys((*node.needs, *(child.id for child in children))))
         node.fn = outcome.then
+        # The whole body is replaced, so everything that described the old body
+        # goes with it. A `model` left behind outlives the `prompt` it selected
+        # for, and `Node` rejects that pairing on load, which turns one expansion
+        # into a graph that can never be reopened.
         node.prompt = None
+        node.model = None
+        node.child_id = None
         # Set explicitly rather than left alone: an expansion arriving from a
         # dispatched child finds the node claimed, and a node that stays claimed
         # is never runnable and has its result file re-read forever.

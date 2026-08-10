@@ -92,9 +92,18 @@ def build_child_prompt(node: Node, path: Path) -> str:
 ---
 You are working on one node of a goal graph. Its id is {node.id}.
 
-When you are finished, write your outcome to this exact path as JSON:
+When you are finished, write your outcome as JSON to this exact path:
 
     {path}
+
+Write it to a temporary file in the same directory and rename it into place, so
+your parent never reads a half-written file. In Python:
+
+    import json, os
+    tmp = "{path}.partial"
+    with open(tmp, "w") as handle:
+        json.dump(outcome, handle)
+    os.replace(tmp, "{path}")
 
 The file must be an object with an "outcome" key set to one of:
 
@@ -105,9 +114,17 @@ The file must be an object with an "outcome" key set to one of:
 - {{"outcome": "expand", "children": [{{"intent": "...", "prompt": "..."}}, ...]}}
   when the work should be split. Each child needs an "intent" and either a
   "prompt" (a model does it), an "fn" naming a body registered in the parent, or
-  neither (it collects its dependencies). You may also set "needs" to a list of
-  ids of other children in the same list, and "model" to a provider/model
-  selector. Your node completes when its children do.
+  neither (it collects its dependencies). "model" may name a provider/model
+  selector for that child. Your node completes when its children do.
+
+  To order children, give a child a "key" of your choosing and list those keys
+  in another child's "needs". Keys are local to this one list and are resolved
+  to real ids here; you cannot see or set ids. For example:
+
+      {{"outcome": "expand", "children": [
+        {{"key": "build", "intent": "build it", "prompt": "..."}},
+        {{"intent": "test it", "prompt": "...", "needs": ["build"]}}
+      ]}}
 
 Write the file before you reply. Then send one short line to your parent with
 `agent_message.send(..., receiver_role="parent")` starting with {node.id}. The
@@ -135,29 +152,65 @@ def parse_result(payload: Any, node: Node) -> Outcome:
         raw_children = payload.get("children")
         if not isinstance(raw_children, list) or not raw_children:
             raise ValueError(f"result file for {node.id} expanded without children")
-        return Expand([_child_node(raw, node) for raw in raw_children])
+        return Expand(_expand_children(raw_children, node))
     raise ValueError(f"result file for {node.id} has unknown outcome {outcome!r}")
+
+
+def _expand_children(raw_children: list[Any], parent: Node) -> list[Node]:
+    """Build the children, resolving sibling ordering by local key.
+
+    A child cannot know the ids in the parent's graph and is not allowed to
+    invent them, so ordering is expressed with keys it chooses itself and this
+    maps them to the ids assigned here.
+    """
+    built = [(_child_node(raw, parent), raw) for raw in raw_children]
+
+    keys: dict[str, str] = {}
+    for child, raw in built:
+        key = raw.get("key")
+        if key is None:
+            continue
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"child of {parent.id} has an invalid key")
+        if key in keys:
+            raise ValueError(f"children of {parent.id} reuse the key {key!r}")
+        keys[key] = child.id
+
+    for child, raw in built:
+        requested = raw.get("needs") or []
+        if isinstance(requested, str) or not isinstance(requested, list):
+            raise ValueError(f"child of {parent.id} must give needs as a list of sibling keys")
+        resolved = []
+        for entry in requested:
+            if not isinstance(entry, str) or entry not in keys:
+                raise ValueError(
+                    f"child of {parent.id} needs {entry!r}, which is not the key of any sibling in this expansion"
+                )
+            resolved.append(keys[entry])
+        child.needs = tuple(dict.fromkeys(resolved))
+    return [child for child, _ in built]
 
 
 def _child_node(raw: Any, parent: Node) -> Node:
     if not isinstance(raw, dict):
         raise ValueError(f"child of {parent.id} must be an object, got {type(raw).__name__}")
+    if "id" in raw:
+        # Ids are assigned here, not by the child: a child cannot know what is
+        # already in the graph, and a collision would fail the whole expansion.
+        # Ordering between siblings goes through "key" instead.
+        raise ValueError(f"child of {parent.id} must not choose its own id")
     intent = raw.get("intent")
     if not isinstance(intent, str) or not intent.strip():
         raise ValueError(f"child of {parent.id} is missing an intent")
-    node = Node(
+    # `needs` is deliberately absent here: it names sibling keys, which only mean
+    # something once every sibling has an id. `_expand_children` fills it in.
+    return Node(
         intent=intent,
         fn=_optional_str(raw.get("fn"), "fn", parent),
         prompt=_optional_str(raw.get("prompt"), "prompt", parent),
         args=dict(raw.get("args") or {}),
-        needs=tuple(raw.get("needs") or ()),
         model=_optional_str(raw.get("model"), "model", parent),
     )
-    if "id" in raw:
-        # Ids are assigned here, not by the child: a child cannot know what is
-        # already in the graph, and a collision would fail the whole expansion.
-        raise ValueError(f"child of {parent.id} must not choose its own id")
-    return node
 
 
 def _optional_str(value: Any, field: str, parent: Node) -> str | None:

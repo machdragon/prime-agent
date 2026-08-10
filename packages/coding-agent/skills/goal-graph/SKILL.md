@@ -88,7 +88,14 @@ fails its node saying so, rather than holding the graph open forever.
 
 A dispatched child may itself return `expand`, so decomposition is available at
 any depth, not only to whatever created the graph. Its children may name an `fn`
-registered in this kernel.
+registered in this kernel, and may name a `model`.
+
+A child cannot see or choose node ids. To order its children it gives one a
+`key` of its own choosing and lists that key in another child's `needs`; the
+keys are resolved to real ids here. Children are told to write their result to a
+temporary file and rename it into place, and a result that will not parse while
+the child is still running is retried rather than treated as a failure, so
+finished work is not discarded over timing.
 
 ## API
 

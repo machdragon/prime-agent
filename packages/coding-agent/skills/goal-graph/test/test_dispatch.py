@@ -229,6 +229,58 @@ class ChildOutcomeTest(DispatchTestCase):
         self.assertEqual(len(g), 2)
         self.assertTrue(result_path(g.results_dir, node.id).exists())
 
+    def test_an_expanded_node_drops_the_body_it_no_longer_has(self) -> None:
+        # `model` outliving `prompt` is a pairing Node rejects on load, so the
+        # whole graph would stop reopening after one expansion.
+        g = self.graph("survives")
+        node = g.add(Node(intent="split", prompt="decide", model="opencode-go/glm-5.2"))
+        run(g.run())
+        self.write_result(g, node.id, {"outcome": "expand", "children": [{"intent": "child", "prompt": "do"}]})
+        run(g.run())
+
+        self.assertIsNone(g.get(node.id).prompt)
+        self.assertIsNone(g.get(node.id).model)
+        self.assertIsNone(g.get(node.id).child_id, "the child described a body this node no longer has")
+
+        reopened = Graph.open("survives", store_dir=self.store_dir, dispatcher=self.dispatcher)
+        self.assertEqual(len(reopened), 2)
+
+    def test_a_child_keeps_the_model_it_asked_for(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="split", prompt="decide"))
+        run(g.run())
+        self.write_result(
+            g,
+            node.id,
+            {"outcome": "expand", "children": [{"intent": "hard part", "prompt": "do", "model": "opencode-go/kimi-k3"}]},
+        )
+        run(g.run())
+
+        self.assertEqual(g.children_of(node.id)[0].model, "opencode-go/kimi-k3")
+
+    def test_a_child_orders_siblings_with_local_keys(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="split", prompt="decide"))
+        run(g.run())
+        self.write_result(
+            g,
+            node.id,
+            {
+                "outcome": "expand",
+                "children": [
+                    {"key": "build", "intent": "build it", "prompt": "build"},
+                    {"intent": "test it", "prompt": "test", "needs": ["build"]},
+                ],
+            },
+        )
+        report = run(g.run())
+
+        children = {child.intent: child for child in g.children_of(node.id)}
+        build, test = children["build it"], children["test it"]
+        self.assertEqual(test.needs, (build.id,), "a sibling key must resolve to the id assigned here")
+        self.assertEqual(build.needs, ())
+        self.assertEqual(report.in_flight, (build.id,), "only the unblocked sibling is dispatched")
+
     def test_a_child_expansion_can_name_a_registered_inline_body(self) -> None:
         register(lambda ctx: Done(ctx.args["n"] * 3), name="triple")
         g = self.graph()
@@ -277,12 +329,28 @@ class ChildOutcomeTest(DispatchTestCase):
         self.assertEqual(g.get(node.id).state, "claimed")
         self.assertEqual(report.stopped, "in_flight")
 
-    def test_an_unparsable_result_fails_the_node_not_the_graph(self) -> None:
+    def test_a_half_written_file_is_retried_while_the_child_still_runs(self) -> None:
+        g = self.graph()
+        node = g.add(Node(intent="think", prompt="decide"))
+        run(g.run())
+        g.results_dir.mkdir(parents=True, exist_ok=True)
+        result_path(g.results_dir, node.id).write_text('{"outcome": "do', encoding="utf-8")
+
+        report = run(g.run())
+        self.assertEqual(g.get(node.id).state, "claimed", "a working child must not be failed over timing")
+        self.assertEqual(report.stopped, "in_flight")
+
+        self.write_result(g, node.id, {"outcome": "done", "result": "whole"})
+        self.assertTrue(run(g.run()).complete)
+        self.assertEqual(g.get(node.id).result, "whole")
+
+    def test_an_unparsable_result_fails_the_node_once_the_child_has_stopped(self) -> None:
         g = self.graph()
         node = g.add(Node(intent="think", prompt="decide"))
         run(g.run())
         g.results_dir.mkdir(parents=True, exist_ok=True)
         result_path(g.results_dir, node.id).write_text("{not json", encoding="utf-8")
+        self.dispatcher.status["sub-1"] = "completed"
 
         run(g.run())
 
@@ -295,6 +363,7 @@ class ChildOutcomeTest(DispatchTestCase):
         node = g.add(Node(intent="think", prompt="decide"))
         run(g.run())
         self.write_result(g, node.id, {"outcome": "maybe"})
+        self.dispatcher.status["sub-1"] = "completed"
 
         run(g.run())
 
@@ -325,13 +394,32 @@ class ResultParsingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must not choose its own id"):
             parse_result({"outcome": "expand", "children": [{"intent": "x", "id": "n_1"}]}, self.node())
 
-    def test_a_child_may_depend_on_a_sibling(self) -> None:
+    def test_a_child_may_depend_on_a_sibling_by_key(self) -> None:
         outcome = parse_result(
-            {"outcome": "expand", "children": [{"intent": "a"}, {"intent": "b", "needs": []}]},
+            {"outcome": "expand", "children": [{"key": "first", "intent": "a"}, {"intent": "b", "needs": ["first"]}]},
             self.node(),
         )
         assert isinstance(outcome, Expand)
+        first, second = outcome.children
         self.assertEqual([child.intent for child in outcome.children], ["a", "b"])
+        self.assertEqual(second.needs, (first.id,))
+
+    def test_a_needs_entry_that_is_not_a_sibling_key_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not the key of any sibling"):
+            parse_result({"outcome": "expand", "children": [{"intent": "a", "needs": ["nope"]}]}, self.node())
+
+    def test_duplicate_sibling_keys_are_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "reuse the key"):
+            parse_result(
+                {"outcome": "expand", "children": [{"key": "k", "intent": "a"}, {"key": "k", "intent": "b"}]},
+                self.node(),
+            )
+
+    def test_the_prompt_documents_keys_rather_than_ids(self) -> None:
+        prompt = build_child_prompt(self.node(), Path("/tmp/results/n_test.json"))
+        self.assertIn('"key"', prompt)
+        self.assertIn("cannot see or set ids", prompt)
+        self.assertIn("os.replace", prompt)
 
     def test_a_non_object_result_is_refused(self) -> None:
         with self.assertRaisesRegex(ValueError, "must contain an object"):

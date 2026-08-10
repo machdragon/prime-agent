@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Fixed a goal graph becoming permanently unreadable after a node that named a model was split into sub-steps.
+- Fixed sub-steps losing the model they asked for, and sub-step ordering being rejected outright.
+- Fixed a result read while it was still being written failing work that had actually succeeded.
+
 - Added the bundled `goal-graph` skill for decomposing a goal into tracked sub-work that resumes across turns and sessions.
 - Added goal-graph dispatch, running nodes that need a model as subagents and joining their results back into the graph.
 - Added privacy-safe pseudonymous product analytics for onboarding, command use, execution modes, run outcomes, TTFT, latency, usage, tools, retries, and compactions, with disclosure and opt-out controls ([ENG-4682](https://linear.app/primeintellect/issue/ENG-4682/add-privacy-safe-posthog-analytics-to-prime-agent)).

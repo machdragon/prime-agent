@@ -44,6 +44,7 @@ from .dispatch import (
     RlmDispatcher,
     build_child_prompt,
     parse_result,
+    ran_on_for,
     read_result,
     result_path,
 )
@@ -89,7 +90,14 @@ __all__ = [
 DEFAULT_MAX_SUPERSTEPS = 10_000
 DEFAULT_MAX_NODES = 10_000
 DEFAULT_MAX_IN_FLIGHT = 4
-DEFAULT_POLL_SECONDS = 2.0
+#: How often the orchestrator asks whether the children it spawned are done.
+#:
+#: Children take minutes, so a two-second poll asked the registry roughly a
+#: hundred times per child to learn nothing. Thirty seconds is the heartbeat the
+#: orchestrator is meant to keep: it bounds the join latency at one level of a
+#: dependency chain, and a fan-out of parallel children pays it once because
+#: they finish together. Pass `poll_seconds` to `run()` to override it.
+DEFAULT_POLL_SECONDS = 30.0
 #: How long a claimed node may wait for a child the registry no longer knows
 #: about before the join treats it as a dead attempt and reopens it. The RLM
 #: subagent registry is session-scoped, so a parent that compacts or restarts
@@ -120,9 +128,14 @@ class InFlight:
 
     node_id: str
     intent: str
+    #: The model this child was dispatched on.
     model: str | None
     child_id: str | None
     seconds: float
+    #: Where the child has moved since, when it failed over inside its own
+    #: session. None while it is still on the model it was dispatched with, so a
+    #: present value always means something changed.
+    ran_on: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +144,7 @@ class InFlight:
             "model": self.model,
             "child_id": self.child_id,
             "seconds": round(self.seconds, 1),
+            "ran_on": self.ran_on,
         }
 
 
@@ -383,12 +397,16 @@ class Graph:
             node.state = "open"
             node.child_id = None
             node.claimed_at = None
+            # The next attempt runs somewhere else, so the old attribution would
+            # name a model that did not produce the result the node ends up with.
+            node.ran_on = None
 
         resolved = 0
         now = _now()
         for node in claimed:
             path = result_path(self.results_dir, node.id, max(0, len(node.tried_models) - 1))
             if path.exists():
+                self._attribute(node)
                 try:
                     outcome = parse_result(read_result(path), node)
                 except (ValueError, TypeError, OSError) as exc:
@@ -415,6 +433,7 @@ class Graph:
                 # result that landed in that gap is sitting on disk now. Re-test
                 # before blaming the child, or finished work is discarded.
                 if path.exists():
+                    self._attribute(node)
                     try:
                         outcome = parse_result(read_result(path), node)
                     except (ValueError, TypeError, OSError) as exc:
@@ -493,18 +512,37 @@ class Graph:
         node.claimed_at = _now()
         node.tried_models = (*node.tried_models, model or handle.model)
 
+    def _attribute(self, node: Node) -> None:
+        """Record which model actually produced this node's result.
+
+        Asked at the join rather than at dispatch, because the switch this
+        catches happens inside the child's own session, after the parent has
+        already recorded what it spawned.
+        """
+        dispatched = node.tried_models[-1] if node.tried_models else None
+        attempt = max(0, len(node.tried_models) - 1)
+        node.ran_on = ran_on_for(self._dispatcher, node, attempt, dispatched)
+
     def _in_flight_report(self) -> list[InFlight]:
         now = _now()
-        return [
-            InFlight(
-                node_id=node.id,
-                intent=node.intent,
-                model=node.tried_models[-1] if node.tried_models else None,
-                child_id=node.child_id,
-                seconds=max(0.0, now - node.claimed_at) if node.claimed_at else 0.0,
+        report = []
+        for node in self._in_flight():
+            dispatched = node.tried_models[-1] if node.tried_models else None
+            # Asked live so a switch is visible while the child is still working,
+            # not only once it finishes. Reported only when it differs, so a
+            # value present in the report always means something moved.
+            moved = ran_on_for(self._dispatcher, node, max(0, len(node.tried_models) - 1), dispatched)
+            report.append(
+                InFlight(
+                    node_id=node.id,
+                    intent=node.intent,
+                    model=dispatched,
+                    child_id=node.child_id,
+                    seconds=max(0.0, now - node.claimed_at) if node.claimed_at else 0.0,
+                    ran_on=moved if moved != dispatched else None,
+                )
             )
-            for node in self._in_flight()
-        ]
+        return report
 
     def _in_flight(self) -> list[Node]:
         return [node for node in self._nodes.values() if node.state == "claimed"]

@@ -94,7 +94,29 @@ attempt's answer.
 
 `report.in_flight` carries the node id, intent, model, child id, and how long
 the attempt has been running, because a list of ids cannot tell a child that is
-working from one that has stopped responding.
+working from one that has stopped responding. The orchestrator asks every 30
+seconds by default; children take minutes, so a tighter poll mostly asks the
+registry to confirm nothing changed. Pass `poll_seconds` to change it.
+
+### Which model actually did the work
+
+A child can be moved onto another model **inside its own session**, by a router
+reacting to a provider that started failing. The parent never sees that: it
+spawned `devin-2`, a result came back, so it records `devin-2` for work another
+model may have done. That record reads as evidence while being false.
+
+So a dispatcher may implement `ran_on(session_name, dispatched)`, and the graph
+asks it at the join and while children are in flight. `node.ran_on` is the model
+that produced the result; `node.tried_models` stays the dispatch record, because
+both facts matter and neither corrects the other. `InFlight.ran_on` is set only
+when it differs from `model`, so a value present always means something moved.
+
+Correlation is `node-{id}-{attempt}`, which the graph assigns and Prime sets as
+the child's session name, so it needs no cooperation from the child.
+`RlmDispatcher` does not implement it, and the graph then reports the dispatched
+model, which is the truth as far as it knows. A router that raises or answers
+with nothing usable never fails the node: attribution is a reporting detail and
+must not discard work that already succeeded.
 
 Pass `wait_seconds` to block in the cell instead of ending the turn. A child
 that the subagent registry reports as finished without leaving a result file
@@ -147,7 +169,7 @@ a pass are persisted before the next pass begins.
   run.
 - `g.add(node)` — add one node. Its `needs` must already exist and must not form
   a cycle.
-- `await g.run(max_supersteps=10000, max_nodes=10000, max_in_flight=4, wait_seconds=0, poll_seconds=2, claim_timeout_seconds=600, save=True)`
+- `await g.run(max_supersteps=10000, max_nodes=10000, max_in_flight=4, wait_seconds=0, poll_seconds=30, claim_timeout_seconds=600, save=True)`
   — join finished children, run the frontier, dispatch model nodes, checkpoint,
   repeat until nothing is runnable. Returns a `RunReport` with `stopped`,
   `supersteps`, `executed`, `counts`, `pending_dispatch`, `in_flight`, and

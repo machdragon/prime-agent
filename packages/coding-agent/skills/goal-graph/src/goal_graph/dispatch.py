@@ -42,7 +42,7 @@ class Dispatcher(Protocol):
     seam: a router that reads remaining quota answers it differently without
     the graph changing.
 
-    A dispatcher may also implement `ran_on(node, attempt, dispatched)`, which
+    A dispatcher may also implement `ran_on(session_name, dispatched)`, which
     is optional and absent from this Protocol so existing dispatchers stay
     valid. See `ran_on_for` for what it answers and why the graph asks.
     """

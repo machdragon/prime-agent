@@ -13,9 +13,15 @@ when we decide to. A date says exactly when we last took one, and `-N`
 separates two builds on the same day.
 
 ```bash
-npm run version:date              # today, next unused -N
+npm run version:date              # today, next -N among existing v* tags
 npm run version:date 2026.8.10-3  # exactly this
 ```
+
+`-N` comes from git tags (`vYYYY.M.D-*`), not from the package.json already on
+disk. The script does not create the tag; that is a separate git step after the
+commit. Two runs on the same day without tagging both produce the same `-N`,
+which is how you correct a version that was never released. Tag after the
+release commit when you want the next build number.
 
 It is valid semver, so npm, the caret ranges `sync-versions.js` writes, and the
 update check all keep working. `-N` is a prerelease tag, so `2026.8.10-1` sorts

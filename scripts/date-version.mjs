@@ -15,7 +15,7 @@
  * `2026.8.10-1` < `2026.8.10-2` < `2026.8.11-1`.
  *
  * Usage:
- *   node scripts/date-version.mjs              # today, next free -N
+ *   node scripts/date-version.mjs              # today, next -N among v* tags
  *   node scripts/date-version.mjs 2026.8.10-3  # exactly this
  */
 
@@ -42,6 +42,11 @@ function existingTags() {
 }
 
 function nextBuild(date) {
+	// -N is derived from existing `vYYYY.M.D-*` tags only. This script does not
+	// create the tag (see the closing message), so a second run on the same day
+	// without an intervening `git tag` reuses the same -N. That is deliberate
+	// when correcting a version that was never released; commit-without-tag
+	// then tag is what advances the build number.
 	const prefix = `v${date}-`;
 	const used = existingTags()
 		.map((tag) => tag.trim())

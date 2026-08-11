@@ -82,18 +82,16 @@ function setVersion(path) {
 }
 
 console.log(`Setting all packages to ${version}`);
-const rootPkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const targets = [
 	join(root, "package.json"),
 	...readdirSync(join(root, "packages"), { withFileTypes: true })
 		.filter((entry) => entry.isDirectory())
 		.map((entry) => join(root, "packages", entry.name, "package.json")),
-	// Example extensions are workspaces too, and `sync-versions.js` checks
-	// lockstep across everything it finds.
-	...(rootPkg.workspaces ?? [])
-		.filter((pattern) => !pattern.includes("*"))
-		.map((pattern) => join(root, pattern, "package.json")),
 ];
+// Example extensions under packages/coding-agent/examples/extensions/* are
+// listed as npm workspaces, but they are private samples with their own
+// versions. `sync-versions.js` only inspects direct children of packages/, so
+// it never locksteps them; leave their package.json alone.
 for (const path of new Set(targets)) {
 	if (setVersion(path)) console.log(`  ${path.slice(root.length + 1)}`);
 }

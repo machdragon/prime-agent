@@ -406,7 +406,6 @@ class Graph:
         for node in claimed:
             path = result_path(self.results_dir, node.id, max(0, len(node.tried_models) - 1))
             if path.exists():
-                self._attribute(node)
                 try:
                     outcome = parse_result(read_result(path), node)
                 except (ValueError, TypeError, OSError) as exc:
@@ -421,9 +420,11 @@ class Graph:
                     # that has stopped can be blamed for what its file contains.
                     if await status_of(node) == CHILD_RUNNING:
                         continue
+                    self._attribute(node)
                     node.state = "failed"
                     node.error = str(exc)
                 else:
+                    self._attribute(node)
                     self._apply(node, outcome)
                 resolved += 1
                 continue
@@ -433,15 +434,16 @@ class Graph:
                 # result that landed in that gap is sitting on disk now. Re-test
                 # before blaming the child, or finished work is discarded.
                 if path.exists():
-                    self._attribute(node)
                     try:
                         outcome = parse_result(read_result(path), node)
                     except (ValueError, TypeError, OSError) as exc:
                         if await status_of(node) == CHILD_RUNNING:
                             continue
+                        self._attribute(node)
                         node.state = "failed"
                         node.error = str(exc)
                     else:
+                        self._attribute(node)
                         self._apply(node, outcome)
                     resolved += 1
                     continue

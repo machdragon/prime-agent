@@ -460,19 +460,27 @@ class ChildOutcomeTest(DispatchTestCase):
         self.assertEqual(report.stopped, "in_flight")
 
     def test_a_half_written_file_is_retried_while_the_child_still_runs(self) -> None:
-        g = self.graph()
+        dispatcher = RoutingDispatcher(models=("devin-2/glm-5-2",))
+        g = self.graph(dispatcher=dispatcher)
         node = g.add(Node(intent="think", prompt="decide"))
         run(g.run())
+        dispatcher.moved[f"node-{node.id}-0"] = "cursor/auto"
         g.results_dir.mkdir(parents=True, exist_ok=True)
         result_path(g.results_dir, node.id, 0).write_text('{"outcome": "do', encoding="utf-8")
 
         report = run(g.run())
         self.assertEqual(g.get(node.id).state, "claimed", "a working child must not be failed over timing")
+        self.assertIsNone(
+            g.get(node.id).ran_on,
+            "attribution waits until the result is accepted; a mid-write must not checkpoint a model",
+        )
         self.assertEqual(report.stopped, "in_flight")
 
         self.write_result(g, node.id, {"outcome": "done", "result": "whole"})
+        dispatcher.status["sub-1"] = "completed"
         self.assertTrue(run(g.run()).complete)
         self.assertEqual(g.get(node.id).result, "whole")
+        self.assertEqual(g.get(node.id).ran_on, "cursor/auto")
 
     def test_an_unparsable_result_fails_the_node_once_the_child_has_stopped(self) -> None:
         g = self.graph()

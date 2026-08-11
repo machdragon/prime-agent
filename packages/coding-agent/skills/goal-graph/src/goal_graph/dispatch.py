@@ -70,6 +70,13 @@ def ran_on_for(dispatcher: Any, node: Node, attempt: int, dispatched: str | None
     Correlation is `child_name(node, attempt)`, which the graph itself assigns
     and Prime sets as the child's session name, so it needs no cooperation from
     the child.
+
+    The hook must be cheap and synchronous. The graph calls it from the join and
+    once per in-flight child on every `run()` report, on the event loop's thread.
+    An `async def ran_on` returns a coroutine: it fails the `isinstance(answer,
+    str)` check below, falls back to `dispatched`, and leaves the coroutine
+    un-awaited. A hook that reads a remote log or hits an API blocks the report
+    path for every claimed node.
     """
     resolve = getattr(dispatcher, "ran_on", None)
     if resolve is None:

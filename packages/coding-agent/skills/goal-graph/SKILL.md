@@ -111,6 +111,11 @@ that produced the result; `node.tried_models` stays the dispatch record, because
 both facts matter and neither corrects the other. `InFlight.ran_on` is set only
 when it differs from `model`, so a value present always means something moved.
 
+The hook must be cheap and synchronous: it runs on the event loop once per
+in-flight child on every `run()` report. An async implementation is treated as
+a non-answer (the coroutine is never awaited) and falls back to the dispatched
+model. A hook that blocks on I/O stalls the report path for every claimed node.
+
 Correlation is `node-{id}-{attempt}`, which the graph assigns and Prime sets as
 the child's session name, so it needs no cooperation from the child.
 `RlmDispatcher` does not implement it, and the graph then reports the dispatched

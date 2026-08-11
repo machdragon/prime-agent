@@ -23,6 +23,10 @@
  * So the live suites are opt-in. `PI_E2E=1 npm test` restores them in full.
  * This clears the variables rather than editing the gates, so upstream's test
  * files stay untouched and merging from upstream stays cheap.
+ *
+ * CI is exempt: if a CI job supplies real keys it intends the live suites to
+ * run, so clearing them there would silently hide the tests instead. The
+ * standard `CI` environment variable gates this.
  */
 
 /** Every API-key variable in `getApiKeyEnvVars`, plus the OAuth token forms. */
@@ -59,6 +63,6 @@ const CREDENTIAL_ENV_VARS = [
 	"ZAI_API_KEY",
 ];
 
-if (process.env.PI_E2E !== "1") {
+if (process.env.PI_E2E !== "1" && process.env.CI !== "true") {
 	for (const name of CREDENTIAL_ENV_VARS) delete process.env[name];
 }

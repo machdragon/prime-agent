@@ -17,13 +17,21 @@ npm run version:date              # today, next -N among existing v* tags
 npm run version:date 2026.8.10-3  # exactly this
 ```
 
-`version:date` refreshes the lockfile in place rather than deleting it. Deleting
-it re-resolves every caret range to whatever is newest, which is a dependency
-upgrade smuggled into a version bump: cutting `2026.8.15-1` that way moved
-`@mistralai/mistralai` from 2.2.1 to 2.6.1, whose OpenTelemetry imports the
-bundler cannot resolve because they come from an optional peer nothing installs,
-and the build failed on a change that had nothing to do with the version. Upgrade
-dependencies deliberately, in their own commit.
+`version:date` clears `node_modules` but keeps `package-lock.json`. Deleting the
+lockfile re-resolves every caret range to whatever is newest, which is a
+dependency upgrade smuggled into a version bump: cutting `2026.8.15-1` that way
+moved `@mistralai/mistralai` from 2.2.1 to 2.6.1, whose OpenTelemetry imports
+the bundler cannot resolve because they come from an optional peer nothing
+installs, and the build failed on a change that had nothing to do with the
+version. Upgrade dependencies deliberately, in their own commit.
+
+Only the lockfile needed to survive, not the installed tree. `node_modules` is
+still wiped, so the release is built against exactly what the lockfile
+describes rather than against whatever an earlier aborted install left behind.
+
+`version:patch`, `version:minor` and `version:major` still carry the
+lockfile-deleting form, and therefore that hazard. They are unreachable here
+because they refuse to run on a date version, as below.
 
 `-N` comes from git tags (`vYYYY.M.D-*`), not from the package.json already on
 disk. The script does not create the tag; that is a separate git step after the
@@ -74,9 +82,21 @@ twice: `typebox` stayed at `^1.1.24` in `packages/agent` and `typescript` at
 So the divergence is kept narrow and deliberate:
 
 - **Dependency ranges: none.** This fork carries upstream's ranges exactly.
-  `npm run check:fork-deps` compares every range against the release named in
-  `upstream.json` and fails on any difference. Where a divergence is genuinely
-  needed, record it under `dependencyExceptions` there with the reason.
+  `npm run check:fork-deps` compares every manifest against the release named in
+  `upstream.json` and fails both ways: on a range the fork holds back, and on a
+  dependency upstream has that a merge dropped. Where a divergence is genuinely
+  needed, record it under `dependencyExceptions` there, keyed by the manifest
+  path it applies to, with the reason:
+
+  ```json
+  "dependencyExceptions": {
+    "packages/tui/package.json": { "typescript": "why it has to differ" }
+  }
+  ```
+
+  Keyed by manifest, not by dependency name alone: one approved difference must
+  not switch the check off for that dependency everywhere else, since
+  single-workspace drift is the thing it exists to catch.
 - **Versions: always, and mechanically.** Every package carries the date
   version, so `package.json` conflicts on every upstream release. The fork's
   side always wins.

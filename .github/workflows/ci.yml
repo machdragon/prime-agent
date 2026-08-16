@@ -21,6 +21,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # `npm run check` runs check:fork-deps, which reads the upstream
+          # release named in upstream.json out of git history. At the default
+          # depth of 1 that object is absent and the check would report itself
+          # skipped, so the drift protection would exist only on dev machines.
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v7.0.0

@@ -24,7 +24,7 @@
 		"version:minor": "npm version minor -ws --no-git-tag-version && node scripts/sync-versions.js && shx rm -rf node_modules packages/*/node_modules package-lock.json && npm install",
 		"version:major": "npm version major -ws --no-git-tag-version && node scripts/sync-versions.js && shx rm -rf node_modules packages/*/node_modules package-lock.json && npm install",
 		"version:set": "npm version -ws",
-	"version:date": "node scripts/date-version.mjs && shx rm -rf node_modules packages/*/node_modules package-lock.json && npm install",
+		"version:date": "node scripts/date-version.mjs && shx rm -rf node_modules packages/*/node_modules package-lock.json && npm install",
 		"prepublishOnly": "npm run clean && npm run build && npm run check",
 		"publish": "npm run prepublishOnly && npm publish -ws --access public",
 		"publish:dry": "npm run prepublishOnly && npm publish -ws --access public --dry-run",
@@ -36,7 +36,7 @@
 	},
 	"devDependencies": {
 		"@anthropic-ai/sandbox-runtime": "^0.0.55",
-		"@biomejs/biome": "2.3.5",
+		"@biomejs/biome": "2.5.5",
 		"@types/node": "^22.10.5",
 		"@typescript/native-preview": "7.0.0-dev.20260120.1",
 		"concurrently": "^9.2.4",

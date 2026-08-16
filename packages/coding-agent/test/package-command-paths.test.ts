@@ -356,7 +356,8 @@ else {
 		});
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ package: "prime-agent", tarball: tarballPath, version: "0.73.0" })),
+			// Outranks VERSION, which in this fork is a date. See FORK.md.
+			vi.fn(async () => Response.json({ package: "prime-agent", tarball: tarballPath, version: "9999.0.0" })),
 		);
 
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});

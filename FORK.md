@@ -46,6 +46,15 @@ update check all keep working. `-N` is a prerelease tag, so `2026.8.10-1` sorts
 before a bare `2026.8.10`; we never build a bare one, and within the scheme the
 ordering is right: `2026.8.10-1` < `2026.8.10-2` < `2026.8.11-1`.
 
+The major is a year, so a date version outranks every upstream release number
+and anything upstream's tests use as an obviously-newest sentinel. `update
+--self` therefore always decides there is nothing newer, which is correct here
+(see **Building and installing** below), but it also silently inverted five
+upstream self-update tests, which mocked releases at `999.0.0` and `0.73.0` and
+expected an update to run. Those mocks are now `9999.0.0`. Keep them above the
+year on the next upstream merge, or the tests fail again in a way that looks
+like a product bug and is not.
+
 Versions are written directly rather than through `npm version -ws`, which
 re-resolves workspace dependencies against the registry and fails: these
 `@earendil-works/*` versions are not published there and never will be.

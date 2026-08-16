@@ -520,9 +520,12 @@ describe("self-update daemon restart", () => {
 			configurable: true,
 		});
 		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ npmCommand: ["npm"] }, null, 2));
+		// Must outrank VERSION, which in this fork is a date: 999.0.0 is *older*
+		// than 2026.8.15-1, so it took the no-update path and every test below
+		// that expects an update to run failed. See FORK.md on versioning.
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ version: "999.0.0" })),
+			vi.fn(async () => Response.json({ version: "9999.0.0" })),
 		);
 	});
 

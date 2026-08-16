@@ -29,9 +29,11 @@ Only the lockfile needed to survive, not the installed tree. `node_modules` is
 still wiped, so the release is built against exactly what the lockfile
 describes rather than against whatever an earlier aborted install left behind.
 
-`version:patch`, `version:minor` and `version:major` still carry the
-lockfile-deleting form, and therefore that hazard. They are unreachable here
-because they refuse to run on a date version, as below.
+`version:patch`, `version:minor` and `version:major` keep the lockfile now too.
+The guard below stops them running on a date version, but it keys on the
+version, so a `package.json` set by hand to a semver would have walked straight
+back into the same re-resolve. The hazard has nothing to do with which scheme
+you are on, so it is fixed at the source rather than fenced off.
 
 `-N` comes from git tags (`vYYYY.M.D-*`), not from the package.json already on
 disk. The script does not create the tag; that is a separate git step after the
@@ -84,9 +86,11 @@ So the divergence is kept narrow and deliberate:
 - **Dependency ranges: none.** This fork carries upstream's ranges exactly.
   `npm run check:fork-deps` compares every manifest against the release named in
   `upstream.json` and fails both ways: on a range the fork holds back, and on a
-  dependency upstream has that a merge dropped. Where a divergence is genuinely
-  needed, record it under `dependencyExceptions` there, keyed by the manifest
-  path it applies to, with the reason:
+  dependency upstream has that a merge dropped. It covers `dependencies`,
+  `devDependencies`, `peerDependencies`, `optionalDependencies` and `overrides`
+  -- the last nested, so the `shell-quote` security pin is compared too. Where a
+  divergence is genuinely needed, record it under `dependencyExceptions` there,
+  keyed by the manifest path it applies to, with the reason:
 
   ```json
   "dependencyExceptions": {
@@ -117,6 +121,11 @@ So the divergence is kept narrow and deliberate:
    three-way merge of it: the result describes a tree npm never resolved.
    `.gitattributes` marks it `-merge`, so git reports the conflict and leaves
    our copy instead of inventing a resolution. Delete it; step 4 regenerates it.
+
+   The attribute only guarantees the conflict is *surfaced*. `git merge -X ours`
+   or `-X theirs`, and `git checkout --theirs`, still take one side wholesale
+   and leave a lockfile describing a tree npm never resolved. Regenerating in
+   step 4 is what actually makes it correct.
 
 3. **`CHANGELOG.md`.** Fork entries under `[Unreleased]`, upstream's under its
    released heading.

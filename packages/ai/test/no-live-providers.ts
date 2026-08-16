@@ -25,8 +25,10 @@
  * files stay untouched and merging from upstream stays cheap.
  *
  * CI is exempt: if a CI job supplies real keys it intends the live suites to
- * run, so clearing them there would silently hide the tests instead. The
- * standard `CI` environment variable gates this.
+ * run, so clearing them there would silently hide the tests instead. Any
+ * non-empty `CI` counts, because providers disagree on the value: GitHub
+ * Actions sets `true`, others set `1` or `True`, and testing for one spelling
+ * would clear credentials on the rest and skip the suites the job asked for.
  */
 
 /** Every API-key variable in `getApiKeyEnvVars`, plus the OAuth token forms. */
@@ -63,6 +65,6 @@ const CREDENTIAL_ENV_VARS = [
 	"ZAI_API_KEY",
 ];
 
-if (process.env.PI_E2E !== "1" && process.env.CI !== "true") {
+if (process.env.PI_E2E !== "1" && !process.env.CI) {
 	for (const name of CREDENTIAL_ENV_VARS) delete process.env[name];
 }

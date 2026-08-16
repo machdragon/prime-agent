@@ -40,6 +40,15 @@ Versions are written directly rather than through `npm version -ws`, which
 re-resolves workspace dependencies against the registry and fails: these
 `@earendil-works/*` versions are not published there and never will be.
 
+`version:patch`, `version:minor`, `version:major` and `npm run release:*` are
+upstream's, and they refuse to run while the fork is on a date version. `npm
+version patch` reads the `-1` as a prerelease tag and drops it, so `2026.8.10-1`
+would become the bare `2026.8.10` -- a version we never build, and one that
+sorts *after* every `-N` build of that day, so the mistake would not show up in
+the ordering afterwards. They are guarded rather than deleted so that a merge
+from upstream leaves them intact. `version:set` is not guarded: it takes an
+explicit version, which is how you would deliberately leave the date scheme.
+
 ## Taking upstream changes
 
 Whenever you want them, not on upstream's schedule. Take a release tag rather

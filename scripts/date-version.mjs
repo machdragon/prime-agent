@@ -63,7 +63,11 @@ if (requested && !DATE_VERSION.test(requested)) {
 	console.error(`Not a date version: ${requested}. Expected YYYY.M.D-N, e.g. 2026.8.10-1.`);
 	process.exit(1);
 }
-const version = requested ?? `${today()}-${nextBuild(today())}`;
+// One `today()`, not two: called twice, a run crossing local midnight between
+// them would take the new day's date and the old day's build numbers, and
+// produce a `-1` that already exists.
+const stamp = today();
+const version = requested ?? `${stamp}-${nextBuild(stamp)}`;
 
 /**
  * Written directly rather than through `npm version -ws`, which re-resolves

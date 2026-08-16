@@ -17,6 +17,14 @@ npm run version:date              # today, next -N among existing v* tags
 npm run version:date 2026.8.10-3  # exactly this
 ```
 
+`version:date` refreshes the lockfile in place rather than deleting it. Deleting
+it re-resolves every caret range to whatever is newest, which is a dependency
+upgrade smuggled into a version bump: cutting `2026.8.15-1` that way moved
+`@mistralai/mistralai` from 2.2.1 to 2.6.1, whose OpenTelemetry imports the
+bundler cannot resolve because they come from an optional peer nothing installs,
+and the build failed on a change that had nothing to do with the version. Upgrade
+dependencies deliberately, in their own commit.
+
 `-N` comes from git tags (`vYYYY.M.D-*`), not from the package.json already on
 disk. The script does not create the tag; that is a separate git step after the
 commit. Two runs on the same day without tagging both produce the same `-N`,

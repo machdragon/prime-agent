@@ -1,0 +1,7 @@
+{
+	"comment": "The upstream release this fork is currently based on. Bump this in the same commit that merges a new upstream release; scripts/check-fork-deps.mjs uses it as the baseline for dependency drift.",
+	"remote": "https://github.com/PrimeIntellect-ai/prime-agent.git",
+	"ref": "v0.7.2",
+	"commit": "83a0f9f9566219551fcb6ffaf7f519a815749a58",
+	"dependencyExceptions": {}
+}

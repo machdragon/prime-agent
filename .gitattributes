@@ -9,6 +9,12 @@
 # Shell scripts should keep LF
 *.sh text eol=lf
 
+# Never text-merge the lockfile. A three-way merge of it produces a plausible
+# looking file that describes a tree npm never resolved; regenerating it with
+# `npm install` is the only correct resolution. `-merge` makes git take our side
+# and report the conflict instead of inventing one.
+package-lock.json -merge linguist-generated
+
 # Common binary assets
 *.png binary
 *.jpg binary

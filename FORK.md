@@ -17,6 +17,24 @@ npm run version:date              # today, next -N among existing v* tags
 npm run version:date 2026.8.10-3  # exactly this
 ```
 
+`version:date` clears `node_modules` but keeps `package-lock.json`. Deleting the
+lockfile re-resolves every caret range to whatever is newest, which is a
+dependency upgrade smuggled into a version bump: cutting `2026.8.15-1` that way
+moved `@mistralai/mistralai` from 2.2.1 to 2.6.1, whose OpenTelemetry imports
+the bundler cannot resolve because they come from an optional peer nothing
+installs, and the build failed on a change that had nothing to do with the
+version. Upgrade dependencies deliberately, in their own commit.
+
+Only the lockfile needed to survive, not the installed tree. `node_modules` is
+still wiped, so the release is built against exactly what the lockfile
+describes rather than against whatever an earlier aborted install left behind.
+
+`version:patch`, `version:minor` and `version:major` keep the lockfile now too.
+The guard below stops them running on a date version, but it keys on the
+version, so a `package.json` set by hand to a semver would have walked straight
+back into the same re-resolve. The hazard has nothing to do with which scheme
+you are on, so it is fixed at the source rather than fenced off.
+
 `-N` comes from git tags (`vYYYY.M.D-*`), not from the package.json already on
 disk. The script does not create the tag; that is a separate git step after the
 commit. Two runs on the same day without tagging both produce the same `-N`,
@@ -43,21 +61,98 @@ explicit version, which is how you would deliberately leave the date scheme.
 
 ## Taking upstream changes
 
-Whenever you want them, not on upstream's schedule:
+Whenever you want them, not on upstream's schedule. Take a release tag rather
+than `upstream/main`: it is a known-good point, and it is what `upstream.json`
+records.
 
 ```bash
-git fetch upstream
-git log --oneline HEAD..upstream/main     # what you would be taking
-git checkout -b feat/upstream-YYYY-MM-DD
-git merge upstream/main
+git fetch upstream --tags
+git log --oneline HEAD..v0.7.3     # what you would be taking
+git checkout -b feat/upstream-v0.7.3
+git merge v0.7.3
 ```
 
-The merge will conflict on `package.json` versions, because upstream bumps its
-own and this fork is on a date. **Keep the date version** and re-run
-`npm run version:date` for a fresh one, since taking upstream is exactly the
-event the date is meant to record.
+### Where this fork may differ from upstream
 
-Then rebuild and re-run the checks below before installing.
+Every file this fork edits that upstream also edits is a conflict at the next
+merge. A dependency range this fork holds back is worse than a conflict, because
+git resolves it silently and nothing says it happened. The v0.7.2 merge did that
+twice: `typebox` stayed at `^1.1.24` in `packages/agent` and `typescript` at
+`^5.9.2` in the root while upstream had moved both. Neither produced a conflict,
+`npm run check` passed, and they were only found by reading the tree afterwards.
+
+So the divergence is kept narrow and deliberate:
+
+- **Dependency ranges: none.** This fork carries upstream's ranges exactly.
+  `npm run check:fork-deps` compares every manifest against the release named in
+  `upstream.json` and fails both ways: on a range the fork holds back, and on a
+  dependency upstream has that a merge dropped. It covers `dependencies`,
+  `devDependencies`, `peerDependencies`, `optionalDependencies` and `overrides`
+  -- the last nested, so the `shell-quote` security pin is compared too. Where a
+  divergence is genuinely needed, record it under `dependencyExceptions` there,
+  keyed by the manifest path it applies to, with the reason:
+
+  ```json
+  "dependencyExceptions": {
+    "packages/tui/package.json": { "typescript": "why it has to differ" }
+  }
+  ```
+
+  Keyed by manifest, not by dependency name alone: one approved difference must
+  not switch the check off for that dependency everywhere else, since
+  single-workspace drift is the thing it exists to catch.
+- **Versions: always, and mechanically.** Every package carries the date
+  version, so `package.json` conflicts on every upstream release. The fork's
+  side always wins.
+- **New behaviour: in new files.** A fork feature living in a file upstream does
+  not have never conflicts. `packages/coding-agent/skills/goal-graph/` is the
+  model to copy.
+- **Changelogs: fork entries stay under `[Unreleased]`.** Upstream's arrive
+  under their own released headings below, so the two do not collide.
+
+### Resolving the merge
+
+1. **`package.json`, one per workspace, every time.** Keep the date version and
+   the `@earendil-works/*` ranges. Take upstream's side for everything else,
+   including every third-party dependency range. That last part is the one that
+   gets missed.
+
+2. **`package-lock.json`.** Do not resolve it by hand, and do not trust a
+   three-way merge of it: the result describes a tree npm never resolved.
+   `.gitattributes` marks it `-merge`, so git reports the conflict and leaves
+   our copy instead of inventing a resolution. Delete it; step 4 regenerates it.
+
+   The attribute only guarantees the conflict is *surfaced*. `git merge -X ours`
+   or `-X theirs`, and `git checkout --theirs`, still take one side wholesale
+   and leave a lockfile describing a tree npm never resolved. Regenerating in
+   step 4 is what actually makes it correct.
+
+3. **`CHANGELOG.md`.** Fork entries under `[Unreleased]`, upstream's under its
+   released heading.
+
+4. **Re-baseline and reinstall.** Set `ref` and `commit` in `upstream.json` to
+   the release just merged, then:
+
+   ```bash
+   npm install
+   npm run check:fork-deps     # every range that did not come across
+   ```
+
+   Align each range it reports, or record it as an exception, and reinstall.
+
+5. **Verify before installing.** Run the build, checks, and tests below. The
+   build matters because the fork runs from `dist/`. The tests matter because
+   `npm run check` only typechecks, and a merge of any size can typecheck
+   cleanly and still be broken. The goal-graph skill has Python tests that
+   `npm test` does not reach:
+
+   ```bash
+   cd packages/coding-agent/skills/goal-graph && uv run pytest
+   ```
+
+6. **Cut a release.** Taking upstream is exactly the event the date is meant to
+   record, so re-run `npm run version:date` for a fresh one, then rebuild,
+   commit, and tag.
 
 ## Building and installing
 
@@ -121,6 +216,9 @@ once for the `packages/ai` subpath exports.
   decomposable graph of work, dispatch to RLM children, and attribution of a
   result to the model that actually produced it.
 - Date-based versioning (`scripts/date-version.mjs`).
+- `upstream.json` and `scripts/check-fork-deps.mjs` — the upstream release this
+  fork is based on, and the check that keeps dependency ranges from drifting
+  away from it between merges.
 
 Configuration, providers, routing policy, and the router extension live in
 `~/.dotfiles/prime-agent/`, not here.

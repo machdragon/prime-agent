@@ -187,6 +187,10 @@ Create provider file exporting:
 
 ## Releasing
 
+> This section describes upstream's semver release flow. This fork releases
+> date-based versions on its own cadence instead: see [FORK.md](FORK.md) for
+> that and for how to take a new upstream release.
+
 **Lockstep versioning**: All packages always share the same version number. Every release updates all packages together.
 
 **Version semantics** (no major releases):

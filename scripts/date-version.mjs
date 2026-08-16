@@ -23,6 +23,7 @@ import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DATE_VERSION } from "./version-scheme.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -55,8 +56,6 @@ function nextBuild(date) {
 		.filter((build) => Number.isInteger(build) && build > 0);
 	return used.length === 0 ? 1 : Math.max(...used) + 1;
 }
-
-const DATE_VERSION = /^\d{4}\.\d{1,2}\.\d{1,2}-\d+$/;
 
 const requested = process.argv[2];
 if (requested && !DATE_VERSION.test(requested)) {

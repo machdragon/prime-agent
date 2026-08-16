@@ -41,6 +41,10 @@ class Dispatcher(Protocol):
     the seam a test replaces without booting a session. `candidates` is that
     seam: a router that reads remaining quota answers it differently without
     the graph changing.
+
+    A dispatcher may also implement `ran_on(session_name, dispatched)`, which
+    is optional and absent from this Protocol so existing dispatchers stay
+    valid. See `ran_on_for` for what it answers and why the graph asks.
     """
 
     def candidates(self, node: Node) -> tuple[str | None, ...]: ...
@@ -48,6 +52,42 @@ class Dispatcher(Protocol):
     async def spawn(self, node: Node, prompt: str, model: str | None) -> DispatchHandle: ...
 
     async def statuses(self) -> dict[str, str]: ...
+
+
+def ran_on_for(dispatcher: Any, node: Node, attempt: int, dispatched: str | None) -> str | None:
+    """Which model actually produced this node's result.
+
+    Not always the dispatched one. A child whose provider starts failing can be
+    moved onto another model inside its own session, and the parent never sees
+    that: it spawned `devin-2` and gets a result back, so it records `devin-2`
+    for a patch that `cursor/auto` may have written. That record reads as
+    evidence while being false.
+
+    Only a routing-aware dispatcher knows, so this asks and accepts silence.
+    `RlmDispatcher` does not implement it, and the graph then reports the
+    dispatched model, which is the truth as far as anything here knows.
+
+    Correlation is `child_name(node, attempt)`, which the graph itself assigns
+    and Prime sets as the child's session name, so it needs no cooperation from
+    the child.
+
+    The hook must be cheap and synchronous. The graph calls it from the join and
+    once per in-flight child on every `run()` report, on the event loop's thread.
+    An `async def ran_on` returns a coroutine: it fails the `isinstance(answer,
+    str)` check below, falls back to `dispatched`, and leaves the coroutine
+    un-awaited. A hook that reads a remote log or hits an API blocks the report
+    path for every claimed node.
+    """
+    resolve = getattr(dispatcher, "ran_on", None)
+    if resolve is None:
+        return dispatched
+    try:
+        answer = resolve(child_name(node, attempt), dispatched)
+    except Exception:
+        # Attribution is a reporting detail. A router that cannot read its own
+        # log must not fail the node whose work already succeeded.
+        return dispatched
+    return answer if isinstance(answer, str) and answer.strip() else dispatched
 
 
 class RlmDispatcher:

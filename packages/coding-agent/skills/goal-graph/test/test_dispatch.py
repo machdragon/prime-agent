@@ -460,19 +460,27 @@ class ChildOutcomeTest(DispatchTestCase):
         self.assertEqual(report.stopped, "in_flight")
 
     def test_a_half_written_file_is_retried_while_the_child_still_runs(self) -> None:
-        g = self.graph()
+        dispatcher = RoutingDispatcher(models=("devin-2/glm-5-2",))
+        g = self.graph(dispatcher=dispatcher)
         node = g.add(Node(intent="think", prompt="decide"))
         run(g.run())
+        dispatcher.moved[f"node-{node.id}-0"] = "cursor/auto"
         g.results_dir.mkdir(parents=True, exist_ok=True)
         result_path(g.results_dir, node.id, 0).write_text('{"outcome": "do', encoding="utf-8")
 
         report = run(g.run())
         self.assertEqual(g.get(node.id).state, "claimed", "a working child must not be failed over timing")
+        self.assertIsNone(
+            g.get(node.id).ran_on,
+            "attribution waits until the result is accepted; a mid-write must not checkpoint a model",
+        )
         self.assertEqual(report.stopped, "in_flight")
 
         self.write_result(g, node.id, {"outcome": "done", "result": "whole"})
+        dispatcher.status["sub-1"] = "completed"
         self.assertTrue(run(g.run()).complete)
         self.assertEqual(g.get(node.id).result, "whole")
+        self.assertEqual(g.get(node.id).ran_on, "cursor/auto")
 
     def test_an_unparsable_result_fails_the_node_once_the_child_has_stopped(self) -> None:
         g = self.graph()
@@ -703,6 +711,169 @@ class NodeModelTest(unittest.TestCase):
     def test_a_model_selector_needs_a_prompt(self) -> None:
         with self.assertRaisesRegex(ValueError, "names a model but has no prompt"):
             Node(intent="x", fn="body", model="a/b")
+
+
+class RoutingDispatcher(FakeDispatcher):
+    """A dispatcher that knows a child moved model mid-session."""
+
+    def __init__(self, moved: dict[str, str] | None = None, *, raises: bool = False, answer=None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.moved = moved or {}
+        self.raises = raises
+        self.answer = answer
+        self.asked: list[tuple[str, str | None]] = []
+
+    def ran_on(self, session_name: str, dispatched: str | None) -> str | None:
+        self.asked.append((session_name, dispatched))
+        if self.raises:
+            raise RuntimeError("failover log unreadable")
+        if self.answer is not None:
+            return self.answer
+        return self.moved.get(session_name, dispatched)
+
+
+class RanOnTest(DispatchTestCase):
+    """A node must report the model that actually did the work.
+
+    The parent spawns `devin-2` and gets a result back, so it records `devin-2`
+    even when the child was moved onto another provider inside its own session.
+    That record reads as evidence while being false.
+    """
+
+    def dispatch(self, dispatcher: FakeDispatcher) -> tuple[Graph, Node]:
+        self.dispatcher = dispatcher
+        graph = self.graph()
+        node = graph.add(Node(intent="patch", prompt="fix it"))
+        run(graph.run())
+        return graph, node
+
+    def test_a_plain_dispatcher_reports_the_dispatched_model(self) -> None:
+        # RlmDispatcher knows nothing about routing, and the dispatched model is
+        # then the truth as far as anything here knows.
+        graph, node = self.dispatch(FakeDispatcher(models=("devin-2/glm-5-2",)))
+        self.write_result(graph, node.id, {"outcome": "done", "result": "ok"})
+        self.dispatcher.status["sub-1"] = "completed"
+        run(graph.run())
+        self.assertEqual(graph.get(node.id).ran_on, "devin-2/glm-5-2")
+
+    def test_a_switch_inside_the_child_is_recorded(self) -> None:
+        dispatcher = RoutingDispatcher({"node-": "cursor/auto"}, models=("devin-2/glm-5-2",))
+        graph = self.graph(dispatcher=dispatcher)
+        node = graph.add(Node(intent="patch", prompt="fix it"))
+        run(graph.run())
+        dispatcher.moved[f"node-{node.id}-0"] = "cursor/auto"
+        self.write_result(graph, node.id, {"outcome": "done", "result": "ok"})
+        dispatcher.status["sub-1"] = "completed"
+        run(graph.run())
+
+        resolved = graph.get(node.id)
+        self.assertEqual(resolved.ran_on, "cursor/auto")
+        # The dispatch record is untouched: both facts matter, and one is not a
+        # correction of the other.
+        self.assertEqual(resolved.tried_models, ("devin-2/glm-5-2",))
+
+    def test_correlation_uses_the_child_name_the_graph_assigned(self) -> None:
+        dispatcher = RoutingDispatcher(models=("devin-2/glm-5-2",))
+        graph = self.graph(dispatcher=dispatcher)
+        node = graph.add(Node(intent="patch", prompt="fix it"))
+        run(graph.run())
+        self.write_result(graph, node.id, {"outcome": "done", "result": "ok"})
+        dispatcher.status["sub-1"] = "completed"
+        run(graph.run())
+        self.assertIn((f"node-{node.id}-0", "devin-2/glm-5-2"), dispatcher.asked)
+
+    def test_a_router_that_cannot_read_its_log_does_not_fail_the_node(self) -> None:
+        # Attribution is a reporting detail. Losing it must not discard work
+        # that already succeeded.
+        dispatcher = RoutingDispatcher(raises=True, models=("devin-2/glm-5-2",))
+        graph = self.graph(dispatcher=dispatcher)
+        node = graph.add(Node(intent="patch", prompt="fix it"))
+        run(graph.run())
+        self.write_result(graph, node.id, {"outcome": "done", "result": "ok"})
+        dispatcher.status["sub-1"] = "completed"
+        run(graph.run())
+
+        resolved = graph.get(node.id)
+        self.assertEqual(resolved.state, "done")
+        self.assertEqual(resolved.ran_on, "devin-2/glm-5-2")
+
+    def test_a_nonsense_answer_falls_back_to_the_dispatched_model(self) -> None:
+        for answer in ("", "   ", 7):
+            with self.subTest(answer=answer):
+                dispatcher = RoutingDispatcher(answer=answer, models=("devin-2/glm-5-2",))
+                graph = self.graph(f"nonsense-{answer!r}", dispatcher=dispatcher)
+                node = graph.add(Node(intent="patch", prompt="fix it"))
+                run(graph.run())
+                self.write_result(graph, node.id, {"outcome": "done", "result": "ok"})
+                dispatcher.status["sub-1"] = "completed"
+                run(graph.run())
+                self.assertEqual(graph.get(node.id).ran_on, "devin-2/glm-5-2")
+
+    def test_a_reopened_node_drops_the_old_attribution(self) -> None:
+        # The next attempt runs somewhere else, so keeping it would name a model
+        # that did not produce the result the node ends up with.
+        dispatcher = RoutingDispatcher(models=("devin-2/glm-5-2", "devin-1/glm-5-2"))
+        graph = self.graph(dispatcher=dispatcher)
+        node = graph.add(Node(intent="patch", prompt="fix it"))
+        run(graph.run())
+        dispatcher.status["sub-1"] = "error"
+        run(graph.run())
+
+        reopened = graph.get(node.id)
+        self.assertIsNone(reopened.ran_on)
+        self.assertEqual(reopened.tried_models, ("devin-2/glm-5-2", "devin-1/glm-5-2"))
+
+    def test_a_failed_child_is_still_attributed(self) -> None:
+        dispatcher = RoutingDispatcher(models=("devin-2/glm-5-2",))
+        graph = self.graph(dispatcher=dispatcher)
+        node = graph.add(Node(intent="patch", prompt="fix it"))
+        run(graph.run())
+        dispatcher.moved[f"node-{node.id}-0"] = "cursor/auto"
+        self.write_result(graph, node.id, {"outcome": "nonsense"})
+        dispatcher.status["sub-1"] = "completed"
+        run(graph.run())
+
+        resolved = graph.get(node.id)
+        self.assertEqual(resolved.state, "failed")
+        self.assertEqual(resolved.ran_on, "cursor/auto")
+
+    def test_ran_on_survives_a_checkpoint(self) -> None:
+        dispatcher = RoutingDispatcher(models=("devin-2/glm-5-2",))
+        graph = self.graph(dispatcher=dispatcher)
+        node = graph.add(Node(intent="patch", prompt="fix it"))
+        run(graph.run())
+        dispatcher.moved[f"node-{node.id}-0"] = "cursor/auto"
+        self.write_result(graph, node.id, {"outcome": "done", "result": "ok"})
+        dispatcher.status["sub-1"] = "completed"
+        run(graph.run())
+
+        self.assertEqual(self.graph(dispatcher=dispatcher).get(node.id).ran_on, "cursor/auto")
+
+
+class InFlightReportTest(DispatchTestCase):
+    def test_a_live_switch_is_visible_before_the_child_finishes(self) -> None:
+        dispatcher = RoutingDispatcher(models=("devin-2/glm-5-2",))
+        graph = self.graph(dispatcher=dispatcher)
+        node = graph.add(Node(intent="patch", prompt="fix it"))
+        run(graph.run())
+        dispatcher.moved[f"node-{node.id}-0"] = "cursor/auto"
+
+        entry = run(graph.run()).in_flight[0]
+        self.assertEqual(entry.model, "devin-2/glm-5-2")
+        self.assertEqual(entry.ran_on, "cursor/auto")
+
+    def test_a_child_that_has_not_moved_reports_no_switch(self) -> None:
+        # A value present in the report always means something moved, so a
+        # reader never has to compare two fields to find out.
+        dispatcher = RoutingDispatcher(models=("devin-2/glm-5-2",))
+        graph = self.graph(dispatcher=dispatcher)
+        graph.add(Node(intent="patch", prompt="fix it"))
+        run(graph.run())
+
+        entry = run(graph.run()).in_flight[0]
+        self.assertEqual(entry.model, "devin-2/glm-5-2")
+        self.assertIsNone(entry.ran_on)
+        self.assertIsNone(entry.to_dict()["ran_on"])
 
 
 if __name__ == "__main__":

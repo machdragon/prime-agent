@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added goal graph reporting of the model that actually produced each sub-task's result, so a sub-task moved onto another provider mid-run is no longer credited to the model it was dispatched with.
+- Changed the goal graph orchestrator to check on running sub-tasks every 30 seconds instead of every 2, matching how long sub-tasks actually take.
 - Added a `claim_timeout_seconds` option to goal graph `run()`, so a claimed node whose child is absent from the session-scoped registry (after the parent compacted or restarted) reopens for the next model instead of staying claimed forever.
 - Added fallback models to goal graph dispatch, so work whose provider runs out of quota is retried on the next model instead of failing.
 - Changed the goal graph run report to name the model, child, and elapsed time of each running sub-task, so a working one can be told from a stuck one.

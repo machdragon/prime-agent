@@ -53,6 +53,13 @@ class Node:
     #: needs the next untried candidate, and a person reading the checkpoint
     #: after a provider ran out, need to know what was tried.
     tried_models: tuple[str, ...] = ()
+    #: The model that actually produced the result, which is not always the one
+    #: dispatched: a child whose provider starts failing can be moved onto
+    #: another model inside its own session, and the parent never sees that
+    #: switch. Reporting the dispatched model as the one that did the work would
+    #: read as evidence while being false, so this is filled in at the join from
+    #: whatever the dispatcher knows and stays None when it knows nothing.
+    ran_on: str | None = None
     #: Unix seconds the current attempt was dispatched, so a report can say how
     #: long a child has been working rather than only that it has not finished.
     claimed_at: float | None = None
@@ -101,6 +108,7 @@ class Node:
             "reason": self.reason,
             "child_id": self.child_id,
             "tried_models": list(self.tried_models),
+            "ran_on": self.ran_on,
             "claimed_at": self.claimed_at,
         }
 
@@ -124,6 +132,7 @@ class Node:
                 reason=raw.get("reason"),
                 child_id=raw.get("child_id"),
                 tried_models=tuple(raw.get("tried_models") or ()),
+                ran_on=raw.get("ran_on"),
                 claimed_at=raw.get("claimed_at"),
             )
         except KeyError as exc:

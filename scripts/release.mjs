@@ -19,6 +19,7 @@
 import { execSync } from "child_process";
 import { readFileSync, writeFileSync, readdirSync, existsSync } from "fs";
 import { join } from "path";
+import { assertNotDateVersion } from "./version-scheme.mjs";
 
 const RELEASE_TARGET = process.argv[2];
 const BUMP_TYPES = new Set(["major", "minor", "patch"]);
@@ -28,6 +29,10 @@ if (!RELEASE_TARGET || (!BUMP_TYPES.has(RELEASE_TARGET) && !SEMVER_RE.test(RELEA
 	console.error("Usage: node scripts/release.mjs <major|minor|patch|x.y.z>");
 	process.exit(1);
 }
+
+// This is upstream's release flow, and it bottoms out in `npm version`, which
+// mangles a date version rather than failing on one. See version-scheme.mjs.
+assertNotDateVersion(`release ${RELEASE_TARGET}`);
 
 function run(cmd, options = {}) {
 	console.log(`$ ${cmd}`);
